@@ -208,6 +208,7 @@ class MediaServerApp:
 
         self.library_tabs: dict[int, ttk.Frame] = {}
         self.library_views: dict[int, ttk.Treeview] = {}
+        self.library_paths: dict[int, str] = {}
         self.current_library: Library | None = None
 
         self._build_menu()
@@ -218,13 +219,31 @@ class MediaServerApp:
         menu = tk.Menu(self.root)
         file_menu = tk.Menu(menu, tearoff=0)
         file_menu.add_command(label="New Library...", command=self._open_new_library_dialog)
+        file_menu.add_command(label="Open Library Location", command=self._open_current_library_location)
+        file_menu.add_command(label="Reload Library View", command=self._refresh_current_library)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         menu.add_cascade(label="File", menu=file_menu)
 
         view_menu = tk.Menu(menu, tearoff=0)
         view_menu.add_command(label="Refresh Library", command=self._refresh_current_library)
+        view_menu.add_command(label="Refresh Folder Tree", command=self._refresh_folder_tree)
+        view_menu.add_separator()
+        view_menu.add_command(label="Expand All Folders", command=lambda: self._set_folder_tree_expanded(True))
+        view_menu.add_command(label="Collapse All Folders", command=lambda: self._set_folder_tree_expanded(False))
         menu.add_cascade(label="View", menu=view_menu)
+
+        options_menu = tk.Menu(menu, tearoff=0)
+        options_menu.add_command(
+            label="Library Management", command=lambda: self._show_placeholder("Library Management")
+        )
+        options_menu.add_command(label="Theme", command=lambda: self._show_placeholder("Theme"))
+        options_menu.add_command(label="Export", command=lambda: self._show_placeholder("Export"))
+        menu.add_cascade(label="Options", menu=options_menu)
+
+        help_menu = tk.Menu(menu, tearoff=0)
+        help_menu.add_command(label="About", command=self._show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menu)
 
     def _build_layout(self) -> None:
@@ -243,6 +262,7 @@ class MediaServerApp:
         folder_scroll.grid(row=0, column=1, sticky="ns")
         self.folder_tree.bind("<<TreeviewOpen>>", self._expand_folder_node)
         self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_tree_selected)
+        self.folder_tree.bind("<Double-1>", self._on_folder_tree_double_click)
 
         self.metadata_frame = ttk.Labelframe(left_frame, text="File Metadata", padding=8)
         self.metadata_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
@@ -323,13 +343,15 @@ class MediaServerApp:
         scroll.grid(row=0, column=1, sticky="ns")
 
         tree.bind("<<TreeviewSelect>>", self._on_library_item_selected)
+        tree.bind("<Double-1>", self._on_library_item_double_click)
 
         self.library_tabs[library.library_id] = frame
         self.library_views[library.library_id] = tree
         self.notebook.insert(self.new_tab, frame, text=library.name)
-        self._populate_library_view(library)
+        self.library_paths.setdefault(library.library_id, library.path)
+        self._populate_library_view(library, self.library_paths[library.library_id])
 
-    def _populate_library_view(self, library: Library) -> None:
+    def _populate_library_view(self, library: Library, path: str) -> None:
         tree = self.library_views[library.library_id]
         for item in tree.get_children():
             tree.delete(item)
@@ -339,18 +361,18 @@ class MediaServerApp:
             tree.insert("", "end", values=("Path", library.path))
             return
 
-        if not os.path.isdir(library.path):
-            tree.insert("", "end", values=("Missing", library.path))
+        if not os.path.isdir(path):
+            tree.insert("", "end", values=("Missing", path))
             return
 
         try:
-            entries = sorted(os.listdir(library.path))
+            entries = sorted(os.listdir(path))
         except OSError as exc:
             tree.insert("", "end", values=("Error", str(exc)))
             return
 
         for entry in entries:
-            full_path = os.path.join(library.path, entry)
+            full_path = os.path.join(path, entry)
             entry_type = "Folder" if os.path.isdir(full_path) else "File"
             tree.insert("", "end", values=(entry_type, full_path))
 
@@ -374,13 +396,18 @@ class MediaServerApp:
 
     def _set_current_library(self, library: Library) -> None:
         self.current_library = library
+        self.library_paths.setdefault(library.library_id, library.path)
+        self._populate_library_view(library, self.library_paths[library.library_id])
         self._refresh_folder_tree()
         self._clear_metadata()
 
     def _refresh_current_library(self) -> None:
         if not self.current_library:
             return
-        self._populate_library_view(self.current_library)
+        current_path = self.library_paths.get(
+            self.current_library.library_id, self.current_library.path
+        )
+        self._populate_library_view(self.current_library, current_path)
         self._refresh_folder_tree()
 
     def _refresh_folder_tree(self) -> None:
@@ -433,6 +460,18 @@ class MediaServerApp:
             entry_type = "Unknown"
         self._set_metadata_rows(self._gather_metadata(path, entry_type))
 
+    def _on_folder_tree_double_click(self, _event: tk.Event) -> None:
+        selection = self.folder_tree.selection()
+        if not selection:
+            return
+        node_id = selection[0]
+        values = self.folder_tree.item(node_id, "values")
+        if not values:
+            return
+        path = values[0]
+        if os.path.isdir(path):
+            self._navigate_to_path(path)
+
     def _on_library_item_selected(self, _event: tk.Event) -> None:
         if not self.current_library:
             return
@@ -443,6 +482,62 @@ class MediaServerApp:
         item = tree.item(selection[0])
         entry_type, location = item["values"]
         self._set_metadata_rows(self._gather_metadata(location, entry_type))
+
+    def _on_library_item_double_click(self, _event: tk.Event) -> None:
+        if not self.current_library or self.current_library.library_type != "local":
+            return
+        tree = self.library_views[self.current_library.library_id]
+        selection = tree.selection()
+        if not selection:
+            return
+        item = tree.item(selection[0])
+        entry_type, location = item["values"]
+        if entry_type == "Folder" and os.path.isdir(location):
+            self._navigate_to_path(location)
+
+    def _navigate_to_path(self, path: str) -> None:
+        if not self.current_library or self.current_library.library_type != "local":
+            return
+        if not os.path.isdir(path):
+            return
+        self.library_paths[self.current_library.library_id] = path
+        self._populate_library_view(self.current_library, path)
+        self._clear_metadata()
+
+    def _set_folder_tree_expanded(self, expanded: bool) -> None:
+        def recurse(node: str) -> None:
+            self.folder_tree.item(node, open=expanded)
+            for child in self.folder_tree.get_children(node):
+                recurse(child)
+
+        for root in self.folder_tree.get_children(""):
+            recurse(root)
+
+    def _open_current_library_location(self) -> None:
+        if not self.current_library or self.current_library.library_type != "local":
+            messagebox.showinfo(
+                "Open Library Location", "Select a local library to open its folder."
+            )
+            return
+        path = self.library_paths.get(self.current_library.library_id, self.current_library.path)
+        if not os.path.isdir(path):
+            messagebox.showerror("Open Library Location", "Library path is unavailable.")
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+
+    def _show_placeholder(self, title: str) -> None:
+        messagebox.showinfo(title, f"{title} options will be available in a future update.")
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            "About Media Server Organizer",
+            "Media Server Organizer\nManage and explore your media libraries.",
+        )
 
     def _set_metadata_rows(self, rows: list[tuple[str, str]]) -> None:
         for child in self.metadata_content.winfo_children():
