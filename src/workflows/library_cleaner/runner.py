@@ -387,7 +387,7 @@ def ensure_log_dir(destination_root: Path) -> Path:
 
 
 def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) -> None:
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
+    lines = ["#!/usr/bin/env sh", "set -eu", ""]
     for entry in results:
         if entry.get("status") != "moved":
             continue
