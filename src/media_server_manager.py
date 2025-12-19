@@ -1,4 +1,6 @@
 import argparse
+import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -25,6 +27,18 @@ DEFAULT_THEME = {
     "accent_color": "SystemHighlight",
     "text_color": "SystemWindowText",
 }
+
+
+def load_workflow_runner(workflow_name: str) -> object | None:
+    module_name = f"workflows.{workflow_name}.runner"
+    spec = importlib.util.find_spec(module_name)
+    if spec is None:
+        return None
+    module = importlib.import_module(module_name)
+    runner_cls = getattr(module, "WorkflowRunner", None)
+    if runner_cls is None:
+        return None
+    return runner_cls()
 
 
 @dataclass(frozen=True)
@@ -785,7 +799,11 @@ class WorkflowsDialog(tk.Toplevel):
             self._update_run_state()
             return
         selected_name = self.workflow_list.get(selection[0])
-        self.description_var.set(f"{selected_name} workflow details will appear here.")
+        workflow_runner = load_workflow_runner(selected_name)
+        if workflow_runner:
+            self.description_var.set(workflow_runner.description)
+        else:
+            self.description_var.set(f"{selected_name} workflow details will appear here.")
         self._update_run_state()
 
     def _update_run_state(self) -> None:
@@ -806,25 +824,36 @@ class WorkflowProcessWizard:
     def __init__(self, master: tk.Toplevel, workflow_name: str) -> None:
         self.master = master
         self.workflow_name = workflow_name
+        self.workflow_runner = load_workflow_runner(workflow_name)
         self._options_modal: WorkflowProcessModal | None = None
         self._preview_modal: WorkflowProcessModal | None = None
         self._review_modal: WorkflowProcessModal | None = None
+        self._option_key_by_label: dict[str, str] = {}
+        self._current_options: dict[str, str] = {}
+        self._current_plan: dict[str, object] | None = None
+        self._rollback_script: str | None = None
 
     def open_options(self) -> None:
         if self._options_modal:
             self._options_modal.destroy()
-        self._options_modal = WorkflowProcessModal(
-            master=self.master,
-            title="Workflow Options",
-            header=f"{self.workflow_name} workflow options",
-            list_title="Options",
-            list_items=[
+        if self.workflow_runner:
+            options = self.workflow_runner.get_options()
+            self._option_key_by_label = {option.label: option.key for option in options}
+            list_items = [(option.label, option.value) for option in options]
+        else:
+            list_items = [
                 ("Sort order", "Alphabetical"),
                 ("Rename pattern", "{title} ({year})"),
                 ("Missing metadata", "Skip items"),
                 ("Output directory", "~/Media/Processed"),
                 ("Overwrite existing", "Disabled"),
-            ],
+            ]
+        self._options_modal = WorkflowProcessModal(
+            master=self.master,
+            title="Workflow Options",
+            header=f"{self.workflow_name} workflow options",
+            list_title="Options",
+            list_items=list_items,
             editable=True,
             buttons=[
                 ("Back", self._close_options),
@@ -838,22 +867,40 @@ class WorkflowProcessWizard:
             self._options_modal = None
 
     def _open_preview(self) -> None:
+        options = {}
+        if self.workflow_runner and self._options_modal:
+            options = self._collect_option_values()
         if self._options_modal:
             self._options_modal.destroy()
             self._options_modal = None
         if self._preview_modal:
             self._preview_modal.destroy()
+        list_items = [
+            ("Rename files", "14 items"),
+            ("Move folders", "6 items"),
+            ("Update metadata", "9 items"),
+            ("Skip items", "2 items"),
+        ]
+        if self.workflow_runner:
+            self._current_options = options
+            plan = self.workflow_runner.build_plan(options)
+            errors = plan.get("errors", [])
+            if errors:
+                messagebox.showerror(
+                    "Workflow Error",
+                    "\n".join(str(error) for error in errors),
+                    parent=self.master,
+                )
+                self.open_options()
+                return
+            self._current_plan = plan
+            list_items = plan.get("preview_items", list_items)
         self._preview_modal = WorkflowProcessModal(
             master=self.master,
             title="Preview Changes",
             header=f"{self.workflow_name} preview changes",
             list_title="Planned changes",
-            list_items=[
-                ("Rename files", "14 items"),
-                ("Move folders", "6 items"),
-                ("Update metadata", "9 items"),
-                ("Skip items", "2 items"),
-            ],
+            list_items=list_items,
             editable=False,
             buttons=[
                 ("Back", self._back_to_options),
@@ -873,17 +920,34 @@ class WorkflowProcessWizard:
             self._preview_modal = None
         if self._review_modal:
             self._review_modal.destroy()
+        list_items = [
+            ("Renamed files", "14 succeeded"),
+            ("Moved folders", "6 succeeded"),
+            ("Metadata updates", "9 succeeded"),
+            ("Errors", "0"),
+        ]
+        if self.workflow_runner:
+            options = self._current_options or self._collect_option_values()
+            self._current_options = options
+            plan = self.workflow_runner.build_plan(options)
+            errors = plan.get("errors", [])
+            if errors:
+                messagebox.showerror(
+                    "Workflow Error",
+                    "\n".join(str(error) for error in errors),
+                    parent=self.master,
+                )
+                self.open_options()
+                return
+            result = self.workflow_runner.apply_plan(plan)
+            self._rollback_script = result.get("rollback_script")
+            list_items = result.get("summary_items", list_items)
         self._review_modal = WorkflowProcessModal(
             master=self.master,
             title="Review Changes",
             header=f"{self.workflow_name} results",
             list_title="Completed changes",
-            list_items=[
-                ("Renamed files", "14 succeeded"),
-                ("Moved folders", "6 succeeded"),
-                ("Metadata updates", "9 succeeded"),
-                ("Errors", "0"),
-            ],
+            list_items=list_items,
             editable=False,
             buttons=[
                 ("Rollback", self._rollback),
@@ -893,16 +957,31 @@ class WorkflowProcessWizard:
 
     def _rollback(self) -> None:
         if self._review_modal:
-            messagebox.showinfo(
-                "Rollback",
-                "Rollback will be available in a future update.",
-                parent=self._review_modal,
-            )
+            if not self.workflow_runner:
+                messagebox.showinfo(
+                    "Rollback",
+                    "Rollback will be available in a future update.",
+                    parent=self._review_modal,
+                )
+                return
+            result = self.workflow_runner.rollback(self._rollback_script or "")
+            summary_items = result.get("summary_items", [])
+            if summary_items:
+                self._review_modal.update_list_items(summary_items)
 
     def _finish_review(self) -> None:
         if self._review_modal:
             self._review_modal.destroy()
             self._review_modal = None
+
+    def _collect_option_values(self) -> dict[str, str]:
+        if not self._options_modal:
+            return dict(self._current_options)
+        options: dict[str, str] = {}
+        for label, value in self._options_modal.get_list_items():
+            key = self._option_key_by_label.get(label, label)
+            options[key] = value
+        return options
 
 
 class WorkflowProcessModal(tk.Toplevel):
@@ -970,6 +1049,20 @@ class WorkflowProcessModal(tk.Toplevel):
         self.grab_set()
         self.wait_visibility()
         self.focus_set()
+
+    def get_list_items(self) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        for row_id in self.list_view.get_children():
+            name = self.list_view.set(row_id, "name")
+            value = self.list_view.set(row_id, "value")
+            items.append((name, value))
+        return items
+
+    def update_list_items(self, list_items: list[tuple[str, str]]) -> None:
+        for row_id in self.list_view.get_children():
+            self.list_view.delete(row_id)
+        for name, value in list_items:
+            self.list_view.insert("", "end", values=(name, value))
 
     def _begin_edit(self, event: tk.Event) -> None:
         region = self.list_view.identify("region", event.x, event.y)
