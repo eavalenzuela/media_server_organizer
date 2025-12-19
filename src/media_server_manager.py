@@ -793,11 +793,226 @@ class WorkflowsDialog(tk.Toplevel):
         self.run_button.configure(state="normal" if has_selection else "disabled")
 
     def _run_workflow(self) -> None:
-        messagebox.showinfo(
-            "Workflows",
-            "Workflows will be available in a future update.",
-            parent=self,
+        if not self.workflow_names:
+            return
+        selection = self.workflow_list.curselection()
+        if not selection:
+            return
+        selected_name = self.workflow_list.get(selection[0])
+        WorkflowProcessWizard(self, selected_name).open_options()
+
+
+class WorkflowProcessWizard:
+    def __init__(self, master: tk.Toplevel, workflow_name: str) -> None:
+        self.master = master
+        self.workflow_name = workflow_name
+        self._options_modal: WorkflowProcessModal | None = None
+        self._preview_modal: WorkflowProcessModal | None = None
+        self._review_modal: WorkflowProcessModal | None = None
+
+    def open_options(self) -> None:
+        if self._options_modal:
+            self._options_modal.destroy()
+        self._options_modal = WorkflowProcessModal(
+            master=self.master,
+            title="Workflow Options",
+            header=f"{self.workflow_name} workflow options",
+            list_title="Options",
+            list_items=[
+                ("Sort order", "Alphabetical"),
+                ("Rename pattern", "{title} ({year})"),
+                ("Missing metadata", "Skip items"),
+                ("Output directory", "~/Media/Processed"),
+                ("Overwrite existing", "Disabled"),
+            ],
+            editable=True,
+            buttons=[
+                ("Back", self._close_options),
+                ("Next", self._open_preview),
+            ],
         )
+
+    def _close_options(self) -> None:
+        if self._options_modal:
+            self._options_modal.destroy()
+            self._options_modal = None
+
+    def _open_preview(self) -> None:
+        if self._options_modal:
+            self._options_modal.destroy()
+            self._options_modal = None
+        if self._preview_modal:
+            self._preview_modal.destroy()
+        self._preview_modal = WorkflowProcessModal(
+            master=self.master,
+            title="Preview Changes",
+            header=f"{self.workflow_name} preview changes",
+            list_title="Planned changes",
+            list_items=[
+                ("Rename files", "14 items"),
+                ("Move folders", "6 items"),
+                ("Update metadata", "9 items"),
+                ("Skip items", "2 items"),
+            ],
+            editable=False,
+            buttons=[
+                ("Back", self._back_to_options),
+                ("Next", self._open_review),
+            ],
+        )
+
+    def _back_to_options(self) -> None:
+        if self._preview_modal:
+            self._preview_modal.destroy()
+            self._preview_modal = None
+        self.open_options()
+
+    def _open_review(self) -> None:
+        if self._preview_modal:
+            self._preview_modal.destroy()
+            self._preview_modal = None
+        if self._review_modal:
+            self._review_modal.destroy()
+        self._review_modal = WorkflowProcessModal(
+            master=self.master,
+            title="Review Changes",
+            header=f"{self.workflow_name} results",
+            list_title="Completed changes",
+            list_items=[
+                ("Renamed files", "14 succeeded"),
+                ("Moved folders", "6 succeeded"),
+                ("Metadata updates", "9 succeeded"),
+                ("Errors", "0"),
+            ],
+            editable=False,
+            buttons=[
+                ("Rollback", self._rollback),
+                ("Finish", self._finish_review),
+            ],
+        )
+
+    def _rollback(self) -> None:
+        if self._review_modal:
+            messagebox.showinfo(
+                "Rollback",
+                "Rollback will be available in a future update.",
+                parent=self._review_modal,
+            )
+
+    def _finish_review(self) -> None:
+        if self._review_modal:
+            self._review_modal.destroy()
+            self._review_modal = None
+
+
+class WorkflowProcessModal(tk.Toplevel):
+    def __init__(
+        self,
+        master: tk.Toplevel,
+        title: str,
+        header: str,
+        list_title: str,
+        list_items: list[tuple[str, str]],
+        editable: bool,
+        buttons: list[tuple[str, Callable[[], None]]],
+    ) -> None:
+        super().__init__(master)
+        self.title(title)
+        self.geometry("760x420")
+        self.resizable(False, False)
+        self.transient(master)
+
+        self._edit_entry: ttk.Entry | None = None
+        self._edit_item: str | None = None
+        self._edit_column: str | None = None
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        ttk.Label(container, text=header).grid(row=0, column=0, sticky="w")
+
+        list_frame = ttk.Labelframe(container, text=list_title, padding=12)
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self.list_view = ttk.Treeview(
+            list_frame,
+            columns=("name", "value"),
+            show="headings",
+            selectmode="browse",
+            height=10,
+        )
+        self.list_view.heading("name", text="Item")
+        self.list_view.heading("value", text="Value")
+        self.list_view.column("name", width=240, anchor="w")
+        self.list_view.column("value", width=420, anchor="w")
+        self.list_view.grid(row=0, column=0, sticky="nsew")
+
+        list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.list_view.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.list_view.configure(yscrollcommand=list_scroll.set)
+
+        for name, value in list_items:
+            self.list_view.insert("", "end", values=(name, value))
+
+        if editable:
+            self.list_view.bind("<Double-1>", self._begin_edit)
+            self.list_view.bind("<Return>", self._begin_edit)
+
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        for label, command in buttons:
+            ttk.Button(button_frame, text=label, command=command).pack(side="right", padx=(6, 0))
+
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _begin_edit(self, event: tk.Event) -> None:
+        region = self.list_view.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.list_view.identify_column(event.x)
+        if column != "#2":
+            return
+        row_id = self.list_view.identify_row(event.y)
+        if not row_id:
+            return
+        self._start_edit(row_id, column)
+
+    def _start_edit(self, row_id: str, column: str) -> None:
+        self._end_edit(commit=False)
+        bbox = self.list_view.bbox(row_id, column)
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        value = self.list_view.set(row_id, "value")
+        entry = ttk.Entry(self.list_view)
+        entry.insert(0, value)
+        entry.select_range(0, tk.END)
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.focus_set()
+        entry.bind("<Return>", lambda _event: self._end_edit(commit=True))
+        entry.bind("<Escape>", lambda _event: self._end_edit(commit=False))
+        entry.bind("<FocusOut>", lambda _event: self._end_edit(commit=True))
+        self._edit_entry = entry
+        self._edit_item = row_id
+        self._edit_column = column
+
+    def _end_edit(self, commit: bool) -> None:
+        if not self._edit_entry or not self._edit_item:
+            return
+        entry = self._edit_entry
+        if commit:
+            new_value = entry.get().strip()
+            self.list_view.set(self._edit_item, "value", new_value)
+        entry.destroy()
+        self._edit_entry = None
+        self._edit_item = None
+        self._edit_column = None
 
 
 class MediaServerApp:
