@@ -701,7 +701,7 @@ class ThemeEditorDialog(tk.Toplevel):
 
 
 class WorkflowsDialog(tk.Toplevel):
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(self, master: tk.Tk, current_library_path: str | None = None) -> None:
         super().__init__(master)
         self.title("Workflows")
         self.geometry("860x520")
@@ -709,6 +709,7 @@ class WorkflowsDialog(tk.Toplevel):
 
         self.workflow_names = self._load_workflows()
         self.description_var = tk.StringVar(value="Select a workflow to see details.")
+        self.current_library_path = current_library_path
 
         container = ttk.Frame(self, padding=12)
         container.grid(sticky="nsew")
@@ -799,32 +800,33 @@ class WorkflowsDialog(tk.Toplevel):
         if not selection:
             return
         selected_name = self.workflow_list.get(selection[0])
-        WorkflowProcessWizard(self, selected_name).open_options()
+        WorkflowProcessWizard(self, selected_name, self.current_library_path).open_options()
 
 
 class WorkflowProcessWizard:
-    def __init__(self, master: tk.Toplevel, workflow_name: str) -> None:
+    def __init__(
+        self, master: tk.Toplevel, workflow_name: str, library_path: str | None = None
+    ) -> None:
         self.master = master
         self.workflow_name = workflow_name
+        self.library_path = library_path
         self._options_modal: WorkflowProcessModal | None = None
         self._preview_modal: WorkflowProcessModal | None = None
         self._review_modal: WorkflowProcessModal | None = None
+        self._options: dict[str, str] = {}
+        self._plan: object | None = None
+        self._apply_result: object | None = None
 
     def open_options(self) -> None:
         if self._options_modal:
             self._options_modal.destroy()
+        list_items = self._load_workflow_options()
         self._options_modal = WorkflowProcessModal(
             master=self.master,
             title="Workflow Options",
             header=f"{self.workflow_name} workflow options",
             list_title="Options",
-            list_items=[
-                ("Sort order", "Alphabetical"),
-                ("Rename pattern", "{title} ({year})"),
-                ("Missing metadata", "Skip items"),
-                ("Output directory", "~/Media/Processed"),
-                ("Overwrite existing", "Disabled"),
-            ],
+            list_items=list_items,
             editable=True,
             buttons=[
                 ("Back", self._close_options),
@@ -839,21 +841,18 @@ class WorkflowProcessWizard:
 
     def _open_preview(self) -> None:
         if self._options_modal:
+            self._options = dict(self._options_modal.get_items())
             self._options_modal.destroy()
             self._options_modal = None
         if self._preview_modal:
             self._preview_modal.destroy()
+        list_items = self._build_preview_items()
         self._preview_modal = WorkflowProcessModal(
             master=self.master,
             title="Preview Changes",
             header=f"{self.workflow_name} preview changes",
             list_title="Planned changes",
-            list_items=[
-                ("Rename files", "14 items"),
-                ("Move folders", "6 items"),
-                ("Update metadata", "9 items"),
-                ("Skip items", "2 items"),
-            ],
+            list_items=list_items,
             editable=False,
             buttons=[
                 ("Back", self._back_to_options),
@@ -873,17 +872,13 @@ class WorkflowProcessWizard:
             self._preview_modal = None
         if self._review_modal:
             self._review_modal.destroy()
+        list_items = self._build_review_items()
         self._review_modal = WorkflowProcessModal(
             master=self.master,
             title="Review Changes",
             header=f"{self.workflow_name} results",
             list_title="Completed changes",
-            list_items=[
-                ("Renamed files", "14 succeeded"),
-                ("Moved folders", "6 succeeded"),
-                ("Metadata updates", "9 succeeded"),
-                ("Errors", "0"),
-            ],
+            list_items=list_items,
             editable=False,
             buttons=[
                 ("Rollback", self._rollback),
@@ -893,16 +888,114 @@ class WorkflowProcessWizard:
 
     def _rollback(self) -> None:
         if self._review_modal:
-            messagebox.showinfo(
-                "Rollback",
-                "Rollback will be available in a future update.",
-                parent=self._review_modal,
-            )
+            self._execute_rollback()
 
     def _finish_review(self) -> None:
         if self._review_modal:
             self._review_modal.destroy()
             self._review_modal = None
+
+    def _load_workflow_options(self) -> list[tuple[str, str]]:
+        if self.workflow_name == "library_cleaner":
+            from workflows.library_cleaner import runner as library_cleaner_runner
+
+            return library_cleaner_runner.default_options(self.library_path)
+        return [
+            ("Sort order", "Alphabetical"),
+            ("Rename pattern", "{title} ({year})"),
+            ("Missing metadata", "Skip items"),
+            ("Output directory", "~/Media/Processed"),
+            ("Overwrite existing", "Disabled"),
+        ]
+
+    def _build_preview_items(self) -> list[tuple[str, str]]:
+        if self.workflow_name == "library_cleaner":
+            plan = self._build_library_cleaner_plan()
+            if plan is None:
+                return [("Status", "No plan generated.")]
+            self._plan = plan
+            return plan["summary"]
+        return [
+            ("Rename files", "14 items"),
+            ("Move folders", "6 items"),
+            ("Update metadata", "9 items"),
+            ("Skip items", "2 items"),
+        ]
+
+    def _build_review_items(self) -> list[tuple[str, str]]:
+        if self.workflow_name == "library_cleaner":
+            from workflows.library_cleaner import runner as library_cleaner_runner
+
+            plan_data = self._plan
+            if not isinstance(plan_data, dict) or "plan" not in plan_data:
+                return [("Status", "No plan available to apply.")]
+            apply_result = library_cleaner_runner.apply_plan(plan_data["plan"])
+            self._apply_result = apply_result
+            return library_cleaner_runner.summarize_apply(apply_result)
+        return [
+            ("Renamed files", "14 succeeded"),
+            ("Moved folders", "6 succeeded"),
+            ("Metadata updates", "9 succeeded"),
+            ("Errors", "0"),
+        ]
+
+    def _build_library_cleaner_plan(self) -> dict[str, object] | None:
+        from workflows.library_cleaner import runner as library_cleaner_runner
+
+        library_path = self._options.get("Library path", "").strip() or (self.library_path or "")
+        if not library_path:
+            messagebox.showerror(
+                "Missing Library Path",
+                "Enter a library path before generating the preview.",
+                parent=self.master,
+            )
+            return None
+        root = Path(library_path).expanduser()
+        if not root.exists():
+            messagebox.showerror(
+                "Library Path Not Found",
+                f"The library path '{library_path}' does not exist.",
+                parent=self.master,
+            )
+            return None
+        template = self._options.get("Template", "{artist}/{album}/{track} - {title}")
+        extensions = library_cleaner_runner.parse_extensions(self._options.get("Extensions", ""))
+        plan = library_cleaner_runner.build_plan(root, template, extensions)
+        summary = library_cleaner_runner.summarize_plan(plan)
+        return {"plan": plan, "summary": summary}
+
+    def _execute_rollback(self) -> None:
+        if self.workflow_name != "library_cleaner":
+            messagebox.showinfo(
+                "Rollback",
+                "Rollback is only available for the library_cleaner workflow.",
+                parent=self._review_modal,
+            )
+            return
+        apply_result = self._apply_result
+        if not apply_result or not getattr(apply_result, "rollback_script", None):
+            messagebox.showinfo(
+                "Rollback",
+                "No rollback script is available for this run.",
+                parent=self._review_modal,
+            )
+            return
+        from workflows.library_cleaner import runner as library_cleaner_runner
+
+        rollback_script = apply_result.rollback_script
+        result = library_cleaner_runner.execute_rollback(rollback_script)
+        if result.returncode == 0:
+            messagebox.showinfo(
+                "Rollback",
+                "Rollback completed successfully.",
+                parent=self._review_modal,
+            )
+        else:
+            messagebox.showerror(
+                "Rollback Failed",
+                result.stderr or "Rollback failed. Check the rollback script output.",
+                parent=self._review_modal,
+            )
 
 
 class WorkflowProcessModal(tk.Toplevel):
@@ -1013,6 +1106,14 @@ class WorkflowProcessModal(tk.Toplevel):
         self._edit_entry = None
         self._edit_item = None
         self._edit_column = None
+
+    def get_items(self) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        for row_id in self.list_view.get_children():
+            name = self.list_view.set(row_id, "name")
+            value = self.list_view.set(row_id, "value")
+            items.append((name, value))
+        return items
 
 
 class MediaServerApp:
@@ -1177,7 +1278,8 @@ class MediaServerApp:
         self._sync_libraries()
 
     def _open_workflows_dialog(self) -> None:
-        dialog = WorkflowsDialog(self.root)
+        current_path = self.current_library.path if self.current_library else None
+        dialog = WorkflowsDialog(self.root, current_path)
         self.root.wait_window(dialog)
 
     def _create_library_tab(self, library: Library) -> None:
