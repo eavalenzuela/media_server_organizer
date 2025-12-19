@@ -1,9 +1,14 @@
 import argparse
+import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime
+from fractions import Fraction
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
@@ -240,17 +245,29 @@ class MediaServerApp:
         self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_tree_selected)
 
         self.metadata_frame = ttk.Labelframe(left_frame, text="File Metadata", padding=8)
-        self.metadata_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.metadata_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.metadata_frame.columnconfigure(0, weight=1)
+        self.metadata_frame.rowconfigure(0, weight=1)
 
-        self.metadata_labels: dict[str, ttk.Label] = {}
-        for index, label in enumerate(["Title", "Path", "Type", "Notes"]):
-            ttk.Label(self.metadata_frame, text=f"{label}:").grid(
-                row=index, column=0, sticky="w", padx=(0, 6), pady=2
-            )
-            value_label = ttk.Label(self.metadata_frame, text="—", width=26)
-            value_label.grid(row=index, column=1, sticky="w", pady=2)
-            value_label.bind("<Double-Button-1>", self._edit_metadata_value)
-            self.metadata_labels[label] = value_label
+        self.metadata_canvas = tk.Canvas(self.metadata_frame, highlightthickness=0)
+        self.metadata_scroll = ttk.Scrollbar(
+            self.metadata_frame, orient="vertical", command=self.metadata_canvas.yview
+        )
+        self.metadata_canvas.configure(yscrollcommand=self.metadata_scroll.set)
+        self.metadata_canvas.grid(row=0, column=0, sticky="nsew")
+        self.metadata_scroll.grid(row=0, column=1, sticky="ns")
+
+        self.metadata_content = ttk.Frame(self.metadata_canvas)
+        self.metadata_content.columnconfigure(1, weight=1)
+        self.metadata_window = self.metadata_canvas.create_window(
+            (0, 0), window=self.metadata_content, anchor="nw"
+        )
+        self.metadata_content.bind(
+            "<Configure>", lambda event: self.metadata_canvas.configure(scrollregion=self.metadata_canvas.bbox("all"))
+        )
+        self.metadata_canvas.bind(
+            "<Configure>", lambda event: self.metadata_canvas.itemconfig(self.metadata_window, width=event.width)
+        )
 
         right_frame = ttk.Frame(main_pane)
         right_frame.columnconfigure(0, weight=1)
@@ -414,14 +431,7 @@ class MediaServerApp:
             entry_type = "File"
         else:
             entry_type = "Unknown"
-        self._update_metadata(
-            {
-                "Title": os.path.basename(path) or path,
-                "Path": path,
-                "Type": entry_type,
-                "Notes": "Double-click to edit.",
-            }
-        )
+        self._set_metadata_rows(self._gather_metadata(path, entry_type))
 
     def _on_library_item_selected(self, _event: tk.Event) -> None:
         if not self.current_library:
@@ -432,21 +442,230 @@ class MediaServerApp:
             return
         item = tree.item(selection[0])
         entry_type, location = item["values"]
-        self._update_metadata(
-            {
-                "Title": os.path.basename(location) or location,
-                "Path": location,
-                "Type": entry_type,
-                "Notes": "Double-click to edit.",
-            }
-        )
+        self._set_metadata_rows(self._gather_metadata(location, entry_type))
 
-    def _update_metadata(self, data: dict[str, str]) -> None:
-        for key, label in self.metadata_labels.items():
-            label.config(text=data.get(key, "—"))
+    def _set_metadata_rows(self, rows: list[tuple[str, str]]) -> None:
+        for child in self.metadata_content.winfo_children():
+            child.destroy()
+        if not rows:
+            rows = [("Metadata", "—")]
+        for index, (label, value) in enumerate(rows):
+            ttk.Label(self.metadata_content, text=f"{label}:").grid(
+                row=index, column=0, sticky="nw", padx=(0, 8), pady=2
+            )
+            value_label = ttk.Label(
+                self.metadata_content, text=value or "—", wraplength=240, justify="left"
+            )
+            value_label.grid(row=index, column=1, sticky="w", pady=2)
 
     def _clear_metadata(self) -> None:
-        self._update_metadata({})
+        self._set_metadata_rows([("Metadata", "Select a file or folder to view details.")])
+
+    def _gather_metadata(self, path: str, entry_type: str) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [
+            ("Title", os.path.basename(path) or path),
+            ("Path", path),
+            ("Type", entry_type),
+        ]
+
+        if not os.path.exists(path):
+            rows.append(("Status", "Unavailable"))
+            return rows
+
+        if os.path.isdir(path):
+            try:
+                entries = os.listdir(path)
+            except OSError as exc:
+                rows.append(("Error", str(exc)))
+            else:
+                rows.append(("Item Count", str(len(entries))))
+            return rows
+
+        try:
+            stats = os.stat(path)
+        except OSError as exc:
+            rows.append(("Error", str(exc)))
+            return rows
+
+        rows.extend(
+            [
+                ("Size", f"{self._format_size(stats.st_size)} ({stats.st_size:,} bytes)"),
+                ("Modified", self._format_timestamp(stats.st_mtime)),
+                ("Created", self._format_timestamp(stats.st_ctime)),
+            ]
+        )
+
+        extension = os.path.splitext(path)[1].lower()
+        if extension:
+            rows.append(("Extension", extension))
+
+        if self._is_media_file(extension):
+            rows.extend(self._probe_media(path))
+
+        return rows
+
+    @staticmethod
+    def _format_timestamp(timestamp: float) -> str:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(size_bytes)
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    @staticmethod
+    def _is_media_file(extension: str) -> bool:
+        audio_exts = {".mp3", ".flac", ".aac", ".m4a", ".wav", ".ogg", ".opus"}
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v"}
+        return extension in audio_exts or extension in video_exts
+
+    def _probe_media(self, path: str) -> list[tuple[str, str]]:
+        if not shutil.which("ffprobe"):
+            return [("Media Info", "ffprobe not available on this system.")]
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    "-show_streams",
+                    path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return [("Media Info", f"Unable to read media metadata: {exc}")]
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return [("Media Info", "Unable to parse ffprobe output.")]
+
+        rows: list[tuple[str, str]] = []
+        format_info = data.get("format", {})
+        if format_info:
+            if duration := format_info.get("duration"):
+                rows.append(("Duration", self._format_duration(duration)))
+            if bitrate := format_info.get("bit_rate"):
+                rows.append(("Overall Bitrate", f"{self._format_bitrate(bitrate)}"))
+            if container := format_info.get("format_name"):
+                rows.append(("Container", container))
+
+        streams = data.get("streams", [])
+        video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+        if video_stream:
+            rows.extend(self._video_stream_rows(video_stream))
+        if audio_stream:
+            rows.extend(self._audio_stream_rows(audio_stream))
+
+        tags = {}
+        tags.update(format_info.get("tags", {}) if isinstance(format_info.get("tags"), dict) else {})
+        if audio_stream and isinstance(audio_stream.get("tags"), dict):
+            tags.update(audio_stream["tags"])
+        if video_stream and isinstance(video_stream.get("tags"), dict):
+            tags.update(video_stream["tags"])
+
+        for key, value in self._format_media_tags(tags).items():
+            rows.append((key, value))
+
+        return rows
+
+    @staticmethod
+    def _format_duration(duration: str) -> str:
+        try:
+            total_seconds = float(duration)
+        except (TypeError, ValueError):
+            return duration
+        minutes, seconds = divmod(int(total_seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:d}:{seconds:02d}"
+
+    @staticmethod
+    def _format_bitrate(bit_rate: str) -> str:
+        try:
+            return f"{int(bit_rate) / 1000:.0f} kbps"
+        except (TypeError, ValueError):
+            return bit_rate
+
+    @staticmethod
+    def _video_stream_rows(stream: dict[str, object]) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [("Media Type", "Video")]
+        if codec := stream.get("codec_name"):
+            rows.append(("Video Codec", str(codec)))
+        width = stream.get("width")
+        height = stream.get("height")
+        if width and height:
+            rows.append(("Resolution", f"{width}x{height}"))
+        fps = MediaServerApp._parse_frame_rate(stream.get("avg_frame_rate"))
+        if not fps:
+            fps = MediaServerApp._parse_frame_rate(stream.get("r_frame_rate"))
+        if fps:
+            rows.append(("FPS", fps))
+        if bit_rate := stream.get("bit_rate"):
+            rows.append(("Video Bitrate", MediaServerApp._format_bitrate(str(bit_rate))))
+        return rows
+
+    @staticmethod
+    def _audio_stream_rows(stream: dict[str, object]) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [("Media Type", "Audio")]
+        if codec := stream.get("codec_name"):
+            rows.append(("Audio Codec", str(codec)))
+        if bit_rate := stream.get("bit_rate"):
+            rows.append(("Audio Bitrate", MediaServerApp._format_bitrate(str(bit_rate))))
+        if sample_rate := stream.get("sample_rate"):
+            rows.append(("Sample Rate", f"{int(sample_rate):,} Hz"))
+        if channels := stream.get("channels"):
+            rows.append(("Channels", str(channels)))
+        return rows
+
+    @staticmethod
+    def _parse_frame_rate(rate: object) -> str | None:
+        if not rate or not isinstance(rate, str) or rate == "0/0":
+            return None
+        try:
+            value = float(Fraction(rate))
+        except (ValueError, ZeroDivisionError):
+            return None
+        return f"{value:.2f}"
+
+    @staticmethod
+    def _format_media_tags(tags: dict[str, str]) -> dict[str, str]:
+        preferred = {
+            "artist": "Artist",
+            "album": "Album",
+            "title": "Track Title",
+            "genre": "Genre",
+            "track": "Track",
+            "date": "Year",
+        }
+        formatted: dict[str, str] = {}
+        seen = set()
+        for key, label in preferred.items():
+            value = tags.get(key) or tags.get(key.upper())
+            if value:
+                formatted[label] = str(value)
+                seen.add(key)
+                seen.add(key.upper())
+        for key, value in sorted(tags.items()):
+            if key in seen:
+                continue
+            formatted[f"Tag ({key})"] = str(value)
+        return formatted
 
     def _edit_metadata_value(self, event: tk.Event) -> None:
         label_widget = event.widget
