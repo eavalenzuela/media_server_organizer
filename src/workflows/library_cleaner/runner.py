@@ -52,6 +52,7 @@ class WorkflowPlan:
 class WorkflowResult:
     summary_items: list[tuple[str, str]]
     rollback_script: Path | None
+    rollback_powershell_script: Path | None = None
 
 
 class LibraryCleanerWorkflow:
@@ -132,6 +133,7 @@ class LibraryCleanerWorkflow:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = log_dir / f"library_cleaner_{timestamp}.json"
         rollback_path = log_dir / f"library_cleaner_{timestamp}_rollback.sh"
+        rollback_ps_path = log_dir / f"library_cleaner_{timestamp}_rollback.ps1"
 
         results: list[dict[str, Any]] = []
         success_count = 0
@@ -163,6 +165,7 @@ class LibraryCleanerWorkflow:
                 )
 
         write_rollback_script(rollback_path, results)
+        write_rollback_powershell_script(rollback_ps_path, results)
         log_payload = {
             "workflow": self.name,
             "options": {key: str(value) for key, value in resolved.items()},
@@ -180,7 +183,11 @@ class LibraryCleanerWorkflow:
         if plan.skipped:
             summary_items.append(("Already organized", str(len(plan.skipped))))
 
-        return WorkflowResult(summary_items=summary_items, rollback_script=rollback_path)
+        return WorkflowResult(
+            summary_items=summary_items,
+            rollback_script=rollback_path,
+            rollback_powershell_script=rollback_ps_path,
+        )
 
     def rollback(self, rollback_script: Path) -> WorkflowResult:
         if not rollback_script.exists():
@@ -189,7 +196,8 @@ class LibraryCleanerWorkflow:
                 rollback_script=None,
             )
         try:
-            subprocess.run(["/bin/bash", str(rollback_script)], check=True)
+            rollback_command = build_rollback_command(rollback_script)
+            subprocess.run(rollback_command, check=True)
         except subprocess.CalledProcessError as exc:
             return WorkflowResult(
                 summary_items=[("Rollback", f"Failed with exit code {exc.returncode}")],
@@ -399,6 +407,37 @@ def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) ->
         lines.append("fi")
     rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     rollback_path.chmod(0o755)
+
+
+def write_rollback_powershell_script(
+    rollback_path: Path, results: list[dict[str, Any]]
+) -> None:
+    lines = ["$ErrorActionPreference = 'Stop'", ""]
+    for entry in results:
+        if entry.get("status") != "moved":
+            continue
+        source = entry["source"]
+        destination = entry["destination"]
+        lines.append(f"if (Test-Path -LiteralPath {json.dumps(destination)}) {{")
+        lines.append(f"  New-Item -ItemType Directory -Path {json.dumps(os.path.dirname(source))} -Force | Out-Null")
+        lines.append(
+            f"  Move-Item -LiteralPath {json.dumps(destination)} -Destination {json.dumps(source)} -Force"
+        )
+        lines.append("}")
+    rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_rollback_command(rollback_script: Path) -> list[str]:
+    if os.name == "nt":
+        return [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(rollback_script),
+        ]
+    return ["/bin/sh", str(rollback_script)]
 
 
 def build_options_dict(option_pairs: list[tuple[str, str]]) -> dict[str, str]:

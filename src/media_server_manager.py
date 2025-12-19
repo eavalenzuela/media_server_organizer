@@ -848,6 +848,7 @@ class WorkflowProcessWizard:
         self._options: dict[str, str] = {}
         self._plan: object | None = None
         self._rollback_script: Path | None = None
+        self._rollback_powershell_script: Path | None = None
 
     def open_options(self) -> None:
         if self._options_modal:
@@ -921,6 +922,7 @@ class WorkflowProcessWizard:
                 raise ValueError("No preview plan available.")
             result = getattr(self.runner, "apply")(self._options, self._plan)
             self._rollback_script = getattr(result, "rollback_script", None)
+            self._rollback_powershell_script = getattr(result, "rollback_powershell_script", None)
             review_items = getattr(result, "summary_items", [])
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(
@@ -945,16 +947,22 @@ class WorkflowProcessWizard:
 
     def _rollback(self) -> None:
         if self._review_modal:
-            if not self._rollback_script:
+            rollback_script = self._select_rollback_script()
+            if not rollback_script:
                 messagebox.showinfo(
                     "Rollback",
                     "No rollback script was generated for this run.",
                     parent=self._review_modal,
                 )
                 return
-            result = getattr(self.runner, "rollback")(self._rollback_script)
+            result = getattr(self.runner, "rollback")(rollback_script)
             summary_items = getattr(result, "summary_items", [("Rollback", "Completed")])
             self._review_modal.update_list(summary_items)
+
+    def _select_rollback_script(self) -> Path | None:
+        if os.name == "nt" and self._rollback_powershell_script:
+            return self._rollback_powershell_script
+        return self._rollback_script
 
     def _finish_review(self) -> None:
         if self._review_modal:
