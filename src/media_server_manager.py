@@ -89,6 +89,39 @@ class LibraryDB:
             username=username,
         )
 
+    def update_library(
+        self,
+        library_id: int,
+        name: str,
+        library_type: str,
+        path: str,
+        host: str | None,
+        username: str | None,
+    ) -> Library:
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            UPDATE libraries
+            SET name = ?, library_type = ?, path = ?, host = ?, username = ?
+            WHERE id = ?
+            """,
+            (name, library_type, path, host, username, library_id),
+        )
+        self.connection.commit()
+        return Library(
+            library_id=library_id,
+            name=name,
+            library_type=library_type,
+            path=path,
+            host=host,
+            username=username,
+        )
+
+    def delete_library(self, library_id: int) -> None:
+        cursor = self.connection.cursor()
+        cursor.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+        self.connection.commit()
+
     def close(self) -> None:
         self.connection.close()
 
@@ -199,6 +232,196 @@ class NewLibraryDialog(tk.Toplevel):
         self.destroy()
 
 
+class LibraryManagementDialog(tk.Toplevel):
+    def __init__(self, master: tk.Tk, db: LibraryDB) -> None:
+        super().__init__(master)
+        self.title("Library Management")
+        self.resizable(False, False)
+        self.db = db
+        self.selected_library_id: int | None = None
+
+        self.name_var = tk.StringVar()
+        self.type_var = tk.StringVar(value="local")
+        self.path_var = tk.StringVar()
+        self.host_var = tk.StringVar()
+        self.user_var = tk.StringVar()
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(sticky="nsew")
+        container.columnconfigure(1, weight=1)
+
+        self.library_list = ttk.Treeview(
+            container, columns=("name", "type", "path"), show="headings", height=8
+        )
+        self.library_list.heading("name", text="Name")
+        self.library_list.heading("type", text="Type")
+        self.library_list.heading("path", text="Path")
+        self.library_list.column("name", width=140, anchor="w")
+        self.library_list.column("type", width=80, anchor="w")
+        self.library_list.column("path", width=230, anchor="w")
+        self.library_list.grid(row=0, column=0, rowspan=6, sticky="nsw", padx=(0, 12))
+        self.library_list.bind("<<TreeviewSelect>>", self._on_library_selected)
+
+        ttk.Label(container, text="Name").grid(row=0, column=1, sticky="w")
+        ttk.Entry(container, textvariable=self.name_var, width=36).grid(
+            row=0, column=2, sticky="ew"
+        )
+
+        ttk.Label(container, text="Type").grid(row=1, column=1, sticky="w", pady=(6, 0))
+        type_frame = ttk.Frame(container)
+        type_frame.grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(type_frame, text="Local", variable=self.type_var, value="local").pack(
+            side="left"
+        )
+        ttk.Radiobutton(type_frame, text="Remote", variable=self.type_var, value="remote").pack(
+            side="left", padx=(12, 0)
+        )
+
+        ttk.Label(container, text="Path").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        path_frame = ttk.Frame(container)
+        path_frame.grid(row=2, column=2, sticky="ew", pady=(6, 0))
+        ttk.Entry(path_frame, textvariable=self.path_var, width=28).pack(
+            side="left", fill="x", expand=True
+        )
+        self.browse_button = ttk.Button(path_frame, text="Browse", command=self._browse)
+        self.browse_button.pack(side="left", padx=(6, 0))
+
+        ttk.Label(container, text="Host").grid(row=3, column=1, sticky="w", pady=(6, 0))
+        self.host_entry = ttk.Entry(container, textvariable=self.host_var, width=28)
+        self.host_entry.grid(row=3, column=2, sticky="ew", pady=(6, 0))
+
+        ttk.Label(container, text="Username").grid(row=4, column=1, sticky="w", pady=(6, 0))
+        self.user_entry = ttk.Entry(container, textvariable=self.user_var, width=28)
+        self.user_entry.grid(row=4, column=2, sticky="ew", pady=(6, 0))
+
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=5, column=1, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(button_frame, text="Add Library", command=self._add_library).pack(
+            side="left"
+        )
+        ttk.Button(button_frame, text="Remove", command=self._remove_library).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(button_frame, text="Save Changes", command=self._save_library).pack(
+            side="right"
+        )
+
+        container.columnconfigure(2, weight=1)
+        self.type_var.trace_add("write", lambda *_: self._toggle_remote_fields())
+        self._toggle_remote_fields()
+        self._load_libraries()
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _load_libraries(self) -> None:
+        for item in self.library_list.get_children():
+            self.library_list.delete(item)
+        for library in self.db.fetch_libraries():
+            self.library_list.insert(
+                "",
+                "end",
+                iid=str(library.library_id),
+                values=(library.name, library.library_type, library.path),
+            )
+        if self.library_list.get_children():
+            self.library_list.selection_set(self.library_list.get_children()[0])
+            self._on_library_selected()
+
+    def _on_library_selected(self, _event: tk.Event | None = None) -> None:
+        selection = self.library_list.selection()
+        if not selection:
+            return
+        library_id = int(selection[0])
+        library = next(
+            (item for item in self.db.fetch_libraries() if item.library_id == library_id), None
+        )
+        if not library:
+            return
+        self.selected_library_id = library.library_id
+        self.name_var.set(library.name)
+        self.type_var.set(library.library_type)
+        self.path_var.set(library.path)
+        self.host_var.set(library.host or "")
+        self.user_var.set(library.username or "")
+
+    def _browse(self) -> None:
+        if self.type_var.get() == "local":
+            folder = filedialog.askdirectory(parent=self)
+            if folder:
+                self.path_var.set(folder)
+
+    def _toggle_remote_fields(self) -> None:
+        is_remote = self.type_var.get() == "remote"
+        state = "normal" if is_remote else "disabled"
+        self.host_entry.configure(state=state)
+        self.user_entry.configure(state=state)
+        self.browse_button.configure(state="disabled" if is_remote else "normal")
+        if not is_remote:
+            self.host_var.set("")
+            self.user_var.set("")
+
+    def _validate_form(self) -> bool:
+        name = self.name_var.get().strip()
+        path = self.path_var.get().strip()
+        if not name:
+            messagebox.showerror("Missing name", "Please enter a library name.", parent=self)
+            return False
+        if not path:
+            messagebox.showerror("Missing path", "Please enter a library path.", parent=self)
+            return False
+        if self.type_var.get() == "remote" and not self.host_var.get().strip():
+            messagebox.showerror("Missing host", "Remote libraries require a host.", parent=self)
+            return False
+        return True
+
+    def _add_library(self) -> None:
+        dialog = NewLibraryDialog(self)
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        self.db.add_library(
+            name=dialog.result["name"],
+            library_type=dialog.result["library_type"],
+            path=dialog.result["path"],
+            host=dialog.result["host"],
+            username=dialog.result["username"],
+        )
+        self._load_libraries()
+
+    def _save_library(self) -> None:
+        if self.selected_library_id is None:
+            messagebox.showinfo("Library Management", "Select a library to edit.", parent=self)
+            return
+        if not self._validate_form():
+            return
+        self.db.update_library(
+            library_id=self.selected_library_id,
+            name=self.name_var.get().strip(),
+            library_type=self.type_var.get().strip(),
+            path=self.path_var.get().strip(),
+            host=self.host_var.get().strip() or None,
+            username=self.user_var.get().strip() or None,
+        )
+        self._load_libraries()
+        self.library_list.selection_set(str(self.selected_library_id))
+        self._on_library_selected()
+
+    def _remove_library(self) -> None:
+        if self.selected_library_id is None:
+            messagebox.showinfo("Library Management", "Select a library to remove.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Remove Library",
+            "Are you sure you want to remove this library?",
+            parent=self,
+        ):
+            return
+        self.db.delete_library(self.selected_library_id)
+        self.selected_library_id = None
+        self._load_libraries()
+
+
 class MediaServerApp:
     def __init__(self, root: tk.Tk, db: LibraryDB) -> None:
         self.root = root
@@ -235,7 +458,7 @@ class MediaServerApp:
 
         options_menu = tk.Menu(menu, tearoff=0)
         options_menu.add_command(
-            label="Library Management", command=lambda: self._show_placeholder("Library Management")
+            label="Library Management", command=self._open_library_management_dialog
         )
         options_menu.add_command(label="Theme", command=lambda: self._show_placeholder("Theme"))
         options_menu.add_command(label="Export", command=lambda: self._show_placeholder("Export"))
@@ -326,6 +549,11 @@ class MediaServerApp:
             self.notebook.select(self.library_tabs[library.library_id])
             self._set_current_library(library)
 
+    def _open_library_management_dialog(self) -> None:
+        dialog = LibraryManagementDialog(self.root, self.db)
+        self.root.wait_window(dialog)
+        self._sync_libraries()
+
     def _create_library_tab(self, library: Library) -> None:
         frame = ttk.Frame(self.notebook)
         frame.columnconfigure(0, weight=1)
@@ -350,6 +578,34 @@ class MediaServerApp:
         self.notebook.insert(self.new_tab, frame, text=library.name)
         self.library_paths.setdefault(library.library_id, library.path)
         self._populate_library_view(library, self.library_paths[library.library_id])
+
+    def _sync_libraries(self) -> None:
+        libraries = self.db.fetch_libraries()
+        library_map = {library.library_id: library for library in libraries}
+
+        for library_id in list(self.library_tabs.keys()):
+            if library_id not in library_map:
+                self.notebook.forget(self.library_tabs[library_id])
+                self.library_tabs.pop(library_id, None)
+                self.library_views.pop(library_id, None)
+                self.library_paths.pop(library_id, None)
+
+        for library in libraries:
+            if library.library_id not in self.library_tabs:
+                self._create_library_tab(library)
+            else:
+                self.notebook.tab(self.library_tabs[library.library_id], text=library.name)
+                self.library_paths[library.library_id] = library.path
+
+        if self.current_library and self.current_library.library_id in library_map:
+            self._set_current_library(library_map[self.current_library.library_id])
+        elif libraries:
+            self._set_current_library(libraries[0])
+            self.notebook.select(self.library_tabs[libraries[0].library_id])
+        else:
+            self.current_library = None
+            self._clear_metadata()
+            self._refresh_folder_tree()
 
     def _populate_library_view(self, library: Library, path: str) -> None:
         tree = self.library_views[library.library_id]
