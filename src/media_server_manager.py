@@ -123,13 +123,16 @@ class NewLibraryDialog(tk.Toplevel):
         path_frame.grid(row=2, column=1, sticky="ew", pady=(8, 0))
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var, width=32)
         path_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(path_frame, text="Browse", command=self._browse).pack(side="left", padx=(6, 0))
+        self.browse_button = ttk.Button(path_frame, text="Browse", command=self._browse)
+        self.browse_button.pack(side="left", padx=(6, 0))
 
         ttk.Label(frame, text="Host").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.host_var).grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.host_entry = ttk.Entry(frame, textvariable=self.host_var)
+        self.host_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 
         ttk.Label(frame, text="Username").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.user_var).grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        self.user_entry = ttk.Entry(frame, textvariable=self.user_var)
+        self.user_entry.grid(row=4, column=1, sticky="ew", pady=(8, 0))
 
         button_frame = ttk.Frame(frame)
         button_frame.grid(row=5, column=0, columnspan=2, pady=(12, 0), sticky="e")
@@ -139,6 +142,8 @@ class NewLibraryDialog(tk.Toplevel):
         frame.columnconfigure(1, weight=1)
         self.bind("<Return>", lambda event: self._submit())
         self.bind("<Escape>", lambda event: self._cancel())
+        self.type_var.trace_add("write", lambda *_: self._toggle_remote_fields())
+        self._toggle_remote_fields()
         self.grab_set()
         self.wait_visibility()
         self.focus_set()
@@ -148,6 +153,16 @@ class NewLibraryDialog(tk.Toplevel):
             folder = filedialog.askdirectory(parent=self)
             if folder:
                 self.path_var.set(folder)
+
+    def _toggle_remote_fields(self) -> None:
+        is_remote = self.type_var.get() == "remote"
+        state = "normal" if is_remote else "disabled"
+        self.host_entry.configure(state=state)
+        self.user_entry.configure(state=state)
+        self.browse_button.configure(state="disabled" if is_remote else "normal")
+        if not is_remote:
+            self.host_var.set("")
+            self.user_var.set("")
 
     def _submit(self) -> None:
         name = self.name_var.get().strip()
@@ -222,6 +237,7 @@ class MediaServerApp:
         self.folder_tree.grid(row=0, column=0, sticky="nsew")
         folder_scroll.grid(row=0, column=1, sticky="ns")
         self.folder_tree.bind("<<TreeviewOpen>>", self._expand_folder_node)
+        self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_tree_selected)
 
         self.metadata_frame = ttk.Labelframe(left_frame, text="File Metadata", padding=8)
         self.metadata_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -293,7 +309,7 @@ class MediaServerApp:
 
         self.library_tabs[library.library_id] = frame
         self.library_views[library.library_id] = tree
-        self.notebook.insert(self.new_tab, "end", frame, text=library.name)
+        self.notebook.insert(self.new_tab, frame, text=library.name)
         self._populate_library_view(library)
 
     def _populate_library_view(self, library: Library) -> None:
@@ -382,6 +398,30 @@ class MediaServerApp:
             self.folder_tree.delete(children[0])
             path = self.folder_tree.item(node_id, "values")[0]
             self._populate_folder_children(node_id, path)
+
+    def _on_folder_tree_selected(self, _event: tk.Event) -> None:
+        selection = self.folder_tree.selection()
+        if not selection:
+            return
+        node_id = selection[0]
+        values = self.folder_tree.item(node_id, "values")
+        if not values:
+            return
+        path = values[0]
+        if os.path.isdir(path):
+            entry_type = "Folder"
+        elif os.path.isfile(path):
+            entry_type = "File"
+        else:
+            entry_type = "Unknown"
+        self._update_metadata(
+            {
+                "Title": os.path.basename(path) or path,
+                "Path": path,
+                "Type": entry_type,
+                "Notes": "Double-click to edit.",
+            }
+        )
 
     def _on_library_item_selected(self, _event: tk.Event) -> None:
         if not self.current_library:
