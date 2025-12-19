@@ -543,14 +543,19 @@ class MediaServerApp:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except (subprocess.SubprocessError, OSError) as exc:
             return [("Media Info", f"Unable to read media metadata: {exc}")]
 
+        if not result.stdout:
+            return [("Media Info", "Metadata failed to parse.")]
+
         try:
             data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return [("Media Info", "Unable to parse ffprobe output.")]
+        except (json.JSONDecodeError, TypeError):
+            return [("Media Info", "Metadata failed to parse.")]
 
         rows: list[tuple[str, str]] = []
         format_info = data.get("format", {})
