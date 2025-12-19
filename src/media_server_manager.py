@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
+from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 
@@ -23,28 +24,6 @@ DEFAULT_THEME = {
     "metadata_background": "SystemButtonFace",
     "accent_color": "SystemHighlight",
     "text_color": "SystemWindowText",
-}
-
-BUILT_IN_THEMES = {
-    "Default": DEFAULT_THEME,
-    "Light": {
-        "window_background": "#f4f5f8",
-        "sidebar_background": "#ffffff",
-        "toolbar_background": "#e7e9f0",
-        "treeview_background": "#ffffff",
-        "metadata_background": "#f9fafc",
-        "accent_color": "#3b74ff",
-        "text_color": "#1f2533",
-    },
-    "Dark": {
-        "window_background": "#1f2330",
-        "sidebar_background": "#252a3a",
-        "toolbar_background": "#2d3346",
-        "treeview_background": "#202635",
-        "metadata_background": "#2a3042",
-        "accent_color": "#4f8cff",
-        "text_color": "#e7ebf5",
-    },
 }
 
 
@@ -728,7 +707,7 @@ class MediaServerApp:
         self.root.title("Media Server Organizer")
         self.root.geometry("1200x720")
         self.style = ttk.Style(self.root)
-        self.themes = {name: dict(colors) for name, colors in BUILT_IN_THEMES.items()}
+        self.themes = self._load_themes()
         self.current_theme = dict(self.themes.get("Default", DEFAULT_THEME))
 
         self.library_tabs: dict[int, ttk.Frame] = {}
@@ -771,6 +750,25 @@ class MediaServerApp:
         help_menu.add_command(label="About", command=self._show_about)
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menu)
+
+    def _load_themes(self) -> dict[str, dict[str, str]]:
+        themes: dict[str, dict[str, str]] = {}
+        themes_dir = Path(__file__).resolve().parent / "themes"
+        if themes_dir.is_dir():
+            for theme_path in sorted(themes_dir.glob("*.json")):
+                try:
+                    data = json.loads(theme_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                theme_name = theme_path.stem.replace("_", " ").title()
+                themes[theme_name] = {key: str(value) for key, value in data.items()}
+        if "Default" not in themes:
+            themes["Default"] = dict(DEFAULT_THEME)
+        if "Default" in themes:
+            themes = {"Default": themes.pop("Default"), **themes}
+        return themes
 
     def _build_layout(self) -> None:
         main_pane = ttk.PanedWindow(self.root, orient="horizontal")
