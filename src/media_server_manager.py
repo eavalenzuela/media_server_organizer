@@ -1,4 +1,5 @@
 import argparse
+import colorsys
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
@@ -422,6 +423,313 @@ class LibraryManagementDialog(tk.Toplevel):
         self._load_libraries()
 
 
+class ThemeEditorDialog(tk.Toplevel):
+    COMPONENTS = [
+        ("window_background", "Window Background"),
+        ("sidebar_background", "Sidebar Background"),
+        ("toolbar_background", "Toolbar Background"),
+        ("treeview_background", "Library Tree Background"),
+        ("metadata_background", "Metadata Panel Background"),
+        ("accent_color", "Accent Color"),
+        ("text_color", "Primary Text"),
+    ]
+
+    def __init__(self, master: tk.Tk) -> None:
+        super().__init__(master)
+        self.title("Theme Editor")
+        self.geometry("940x520")
+        self.resizable(False, False)
+
+        self.themes: dict[str, dict[str, str]] = {
+            "Light": {
+                "window_background": "#f4f5f8",
+                "sidebar_background": "#ffffff",
+                "toolbar_background": "#e7e9f0",
+                "treeview_background": "#ffffff",
+                "metadata_background": "#f9fafc",
+                "accent_color": "#3b74ff",
+                "text_color": "#1f2533",
+            },
+            "Dark": {
+                "window_background": "#1f2330",
+                "sidebar_background": "#252a3a",
+                "toolbar_background": "#2d3346",
+                "treeview_background": "#202635",
+                "metadata_background": "#2a3042",
+                "accent_color": "#4f8cff",
+                "text_color": "#e7ebf5",
+            },
+        }
+        self.theme_names = list(self.themes.keys())
+        self.selected_theme_name = tk.StringVar(value=self.theme_names[0])
+        self.selected_component: str | None = None
+
+        self.current_color = tk.StringVar(value="#3b74ff")
+        self.hex_entry = tk.StringVar()
+        self.picker_mode = tk.StringVar(value="gradient")
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        self._build_theme_list(container)
+        self._build_editor_panel(container)
+        self._load_theme(self.theme_names[0])
+
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _build_theme_list(self, parent: ttk.Frame) -> None:
+        left_frame = ttk.Frame(parent)
+        left_frame.grid(row=0, column=0, sticky="ns")
+
+        ttk.Label(left_frame, text="Themes", font=("Segoe UI", 11, "bold")).pack(
+            anchor="w"
+        )
+        list_frame = ttk.Frame(left_frame)
+        list_frame.pack(fill="y", pady=(8, 0))
+
+        self.theme_listbox = tk.Listbox(list_frame, height=16, width=22)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.theme_listbox.yview)
+        self.theme_listbox.configure(yscrollcommand=scroll.set)
+        self.theme_listbox.pack(side="left", fill="y")
+        scroll.pack(side="right", fill="y")
+
+        for name in self.theme_names:
+            self.theme_listbox.insert("end", name)
+        self.theme_listbox.selection_set(0)
+        self.theme_listbox.bind("<<ListboxSelect>>", self._on_theme_selected)
+
+        button_frame = ttk.Frame(left_frame)
+        button_frame.pack(fill="x", pady=(12, 0))
+        ttk.Button(button_frame, text="New Theme", command=self._create_new_theme).pack(
+            fill="x", pady=(0, 6)
+        )
+        ttk.Button(button_frame, text="Save Theme", command=self._save_theme).pack(fill="x")
+
+    def _build_editor_panel(self, parent: ttk.Frame) -> None:
+        right_frame = ttk.Frame(parent)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(18, 0))
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(right_frame, text="Theme Colors", font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+
+        editor_frame = ttk.Frame(right_frame)
+        editor_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        editor_frame.columnconfigure(0, weight=1)
+        editor_frame.rowconfigure(1, weight=1)
+
+        self.component_tree = ttk.Treeview(
+            editor_frame,
+            columns=("component", "color"),
+            show="headings",
+            height=8,
+        )
+        self.component_tree.heading("component", text="Component")
+        self.component_tree.heading("color", text="Color")
+        self.component_tree.column("component", width=260)
+        self.component_tree.column("color", width=120, anchor="center")
+        self.component_tree.grid(row=0, column=0, sticky="nsew")
+        self.component_tree.bind("<<TreeviewSelect>>", self._on_component_selected)
+
+        picker_panel = ttk.Frame(editor_frame, padding=(0, 12, 0, 0))
+        picker_panel.grid(row=1, column=0, sticky="nsew")
+        picker_panel.columnconfigure(1, weight=1)
+
+        mode_frame = ttk.Labelframe(picker_panel, text="Color Picker Options")
+        mode_frame.grid(row=0, column=0, sticky="ew", columnspan=2)
+
+        ttk.Radiobutton(
+            mode_frame,
+            text="Sample from screen",
+            variable=self.picker_mode,
+            value="screen",
+            command=self._show_picker_mode,
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Gradient box",
+            variable=self.picker_mode,
+            value="gradient",
+            command=self._show_picker_mode,
+        ).grid(row=0, column=1, sticky="w", padx=8, pady=6)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Hex code",
+            variable=self.picker_mode,
+            value="hex",
+            command=self._show_picker_mode,
+        ).grid(row=0, column=2, sticky="w", padx=8, pady=6)
+
+        self.mode_container = ttk.Frame(picker_panel)
+        self.mode_container.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.mode_container.columnconfigure(0, weight=1)
+
+        self.mode_frames: dict[str, ttk.Frame] = {}
+        self._build_screen_picker(self.mode_container)
+        self._build_gradient_picker(self.mode_container)
+        self._build_hex_picker(self.mode_container)
+        self._show_picker_mode()
+
+        preview_frame = ttk.Frame(picker_panel)
+        preview_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
+        ttk.Label(preview_frame, text="Selected Color:").pack(side="left")
+        self.color_swatch = tk.Canvas(preview_frame, width=32, height=18, highlightthickness=1)
+        self.color_swatch.pack(side="left", padx=(8, 6))
+        self.color_label = ttk.Label(preview_frame, textvariable=self.current_color)
+        self.color_label.pack(side="left")
+
+        ttk.Button(
+            preview_frame, text="Apply to Component", command=self._apply_color_to_component
+        ).pack(side="right")
+
+    def _build_screen_picker(self, parent: ttk.Frame) -> None:
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            frame,
+            text="Use the system color picker to sample a color from anywhere on screen.",
+            wraplength=520,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(frame, text="Pick Screen Color", command=self._pick_screen_color).grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.mode_frames["screen"] = frame
+
+    def _build_gradient_picker(self, parent: ttk.Frame) -> None:
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text="Click the gradient to choose a color.").pack(anchor="w")
+        self.gradient_canvas = tk.Canvas(frame, width=320, height=140, highlightthickness=1)
+        self.gradient_canvas.pack(pady=(8, 0))
+        self.gradient_canvas.bind("<Button-1>", self._select_gradient_color)
+        self._draw_gradient()
+        self.mode_frames["gradient"] = frame
+
+    def _build_hex_picker(self, parent: ttk.Frame) -> None:
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Enter a hex color code:").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(frame, textvariable=self.hex_entry, width=14)
+        entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(frame, text="Apply Hex", command=self._apply_hex_color).grid(
+            row=0, column=2, sticky="w", padx=(8, 0)
+        )
+        self.mode_frames["hex"] = frame
+
+    def _draw_gradient(self) -> None:
+        width = int(self.gradient_canvas["width"])
+        height = int(self.gradient_canvas["height"])
+        self.gradient_image = tk.PhotoImage(width=width, height=height)
+        for x in range(width):
+            hue = x / max(width - 1, 1)
+            for y in range(height):
+                value = 1 - (y / max(height - 1, 1)) * 0.4
+                red, green, blue = colorsys.hsv_to_rgb(hue, 1.0, value)
+                hex_color = f"#{int(red*255):02x}{int(green*255):02x}{int(blue*255):02x}"
+                self.gradient_image.put(hex_color, (x, y))
+        self.gradient_canvas.create_image(0, 0, anchor="nw", image=self.gradient_image)
+
+    def _show_picker_mode(self) -> None:
+        for frame in self.mode_frames.values():
+            frame.grid_forget()
+        frame = self.mode_frames.get(self.picker_mode.get())
+        if frame:
+            frame.grid(row=0, column=0, sticky="ew")
+
+    def _on_theme_selected(self, event: tk.Event) -> None:
+        selection = self.theme_listbox.curselection()
+        if not selection:
+            return
+        theme_name = self.theme_listbox.get(selection[0])
+        self._load_theme(theme_name)
+
+    def _load_theme(self, theme_name: str) -> None:
+        self.selected_theme_name.set(theme_name)
+        self.component_tree.delete(*self.component_tree.get_children())
+        theme = self.themes.get(theme_name, {})
+        for key, label in self.COMPONENTS:
+            color = theme.get(key, "#ffffff")
+            self.component_tree.insert("", "end", iid=key, values=(label, color))
+        self.component_tree.selection_set(self.COMPONENTS[0][0])
+        self._set_current_color(theme.get(self.COMPONENTS[0][0], "#ffffff"))
+
+    def _on_component_selected(self, event: tk.Event) -> None:
+        selection = self.component_tree.selection()
+        if not selection:
+            return
+        component_id = selection[0]
+        self.selected_component = component_id
+        color = self.component_tree.set(component_id, "color")
+        if color:
+            self._set_current_color(color)
+
+    def _set_current_color(self, color: str) -> None:
+        self.current_color.set(color)
+        self.color_swatch.configure(background=color)
+        self.hex_entry.set(color)
+
+    def _pick_screen_color(self) -> None:
+        result = colorchooser.askcolor(color=self.current_color.get(), parent=self)
+        if result and result[1]:
+            self._set_current_color(result[1])
+
+    def _select_gradient_color(self, event: tk.Event) -> None:
+        width = int(self.gradient_canvas["width"])
+        height = int(self.gradient_canvas["height"])
+        hue = max(0, min(event.x, width - 1)) / max(width - 1, 1)
+        value = 1 - (max(0, min(event.y, height - 1)) / max(height - 1, 1)) * 0.4
+        red, green, blue = colorsys.hsv_to_rgb(hue, 1.0, value)
+        color = f"#{int(red*255):02x}{int(green*255):02x}{int(blue*255):02x}"
+        self._set_current_color(color)
+
+    def _apply_hex_color(self) -> None:
+        value = self.hex_entry.get().strip()
+        if not value.startswith("#"):
+            value = f"#{value}"
+        if len(value) != 7 or any(char not in "0123456789abcdefABCDEF" for char in value[1:]):
+            messagebox.showerror("Invalid Color", "Enter a valid hex color (e.g. #33AADD).")
+            return
+        self._set_current_color(value.lower())
+
+    def _apply_color_to_component(self) -> None:
+        selection = self.component_tree.selection()
+        if not selection:
+            messagebox.showinfo("Theme Editor", "Select a component to update.")
+            return
+        component_id = selection[0]
+        theme_name = self.selected_theme_name.get()
+        color = self.current_color.get()
+        self.component_tree.set(component_id, "color", color)
+        self.themes.setdefault(theme_name, {})[component_id] = color
+
+    def _create_new_theme(self) -> None:
+        name = simpledialog.askstring("New Theme", "Theme name:", parent=self)
+        if not name:
+            return
+        if name in self.themes:
+            messagebox.showerror("New Theme", "That theme name already exists.")
+            return
+        current_theme = self.themes.get(self.selected_theme_name.get(), {})
+        self.themes[name] = dict(current_theme)
+        self.theme_names.append(name)
+        self.theme_listbox.insert("end", name)
+        self.theme_listbox.selection_clear(0, "end")
+        self.theme_listbox.selection_set("end")
+        self._load_theme(name)
+
+    def _save_theme(self) -> None:
+        theme_name = self.selected_theme_name.get()
+        if not theme_name:
+            return
+        messagebox.showinfo("Theme Editor", f"Theme '{theme_name}' saved.")
+
+
 class MediaServerApp:
     def __init__(self, root: tk.Tk, db: LibraryDB) -> None:
         self.root = root
@@ -460,7 +768,7 @@ class MediaServerApp:
         options_menu.add_command(
             label="Library Management", command=self._open_library_management_dialog
         )
-        options_menu.add_command(label="Theme", command=lambda: self._show_placeholder("Theme"))
+        options_menu.add_command(label="Theme", command=self._open_theme_dialog)
         options_menu.add_command(label="Export", command=lambda: self._show_placeholder("Export"))
         menu.add_cascade(label="Options", menu=options_menu)
 
@@ -785,6 +1093,9 @@ class MediaServerApp:
             subprocess.run(["open", path], check=False)
         else:
             subprocess.run(["xdg-open", path], check=False)
+
+    def _open_theme_dialog(self) -> None:
+        ThemeEditorDialog(self.root)
 
     def _show_placeholder(self, title: str) -> None:
         messagebox.showinfo(title, f"{title} options will be available in a future update.")
