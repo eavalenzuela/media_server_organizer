@@ -1,0 +1,9 @@
+{
+  "window_background": "SystemButtonFace",
+  "sidebar_background": "SystemWindow",
+  "toolbar_background": "SystemButtonFace",
+  "treeview_background": "SystemWindow",
+  "metadata_background": "SystemButtonFace",
+  "accent_color": "SystemHighlight",
+  "text_color": "SystemWindowText"
+}

@@ -1,5 +1,4 @@
 import argparse
-import colorsys
 import json
 import os
 import shutil
@@ -7,13 +6,25 @@ import sqlite3
 import subprocess
 import sys
 import tkinter as tk
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
+from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
+
+DEFAULT_THEME = {
+    "window_background": "SystemButtonFace",
+    "sidebar_background": "SystemWindow",
+    "toolbar_background": "SystemButtonFace",
+    "treeview_background": "SystemWindow",
+    "metadata_background": "SystemButtonFace",
+    "accent_color": "SystemHighlight",
+    "text_color": "SystemWindowText",
+}
 
 
 @dataclass(frozen=True)
@@ -434,39 +445,26 @@ class ThemeEditorDialog(tk.Toplevel):
         ("text_color", "Primary Text"),
     ]
 
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(
+        self,
+        master: tk.Tk,
+        themes: dict[str, dict[str, str]],
+        apply_theme_callback: Callable[[dict[str, str]], None] | None = None,
+    ) -> None:
         super().__init__(master)
         self.title("Theme Editor")
         self.geometry("940x520")
         self.resizable(False, False)
 
-        self.themes: dict[str, dict[str, str]] = {
-            "Light": {
-                "window_background": "#f4f5f8",
-                "sidebar_background": "#ffffff",
-                "toolbar_background": "#e7e9f0",
-                "treeview_background": "#ffffff",
-                "metadata_background": "#f9fafc",
-                "accent_color": "#3b74ff",
-                "text_color": "#1f2533",
-            },
-            "Dark": {
-                "window_background": "#1f2330",
-                "sidebar_background": "#252a3a",
-                "toolbar_background": "#2d3346",
-                "treeview_background": "#202635",
-                "metadata_background": "#2a3042",
-                "accent_color": "#4f8cff",
-                "text_color": "#e7ebf5",
-            },
-        }
+        self.themes = themes
         self.theme_names = list(self.themes.keys())
         self.selected_theme_name = tk.StringVar(value=self.theme_names[0])
         self.selected_component: str | None = None
+        self.apply_theme_callback = apply_theme_callback
 
         self.current_color = tk.StringVar(value="#3b74ff")
         self.hex_entry = tk.StringVar()
-        self.picker_mode = tk.StringVar(value="gradient")
+        self.picker_mode = tk.StringVar(value="screen")
 
         container = ttk.Frame(self, padding=12)
         container.pack(fill="both", expand=True)
@@ -507,7 +505,10 @@ class ThemeEditorDialog(tk.Toplevel):
         ttk.Button(button_frame, text="New Theme", command=self._create_new_theme).pack(
             fill="x", pady=(0, 6)
         )
-        ttk.Button(button_frame, text="Save Theme", command=self._save_theme).pack(fill="x")
+        ttk.Button(button_frame, text="Save Theme", command=self._save_theme).pack(
+            fill="x", pady=(0, 6)
+        )
+        ttk.Button(button_frame, text="Apply Theme", command=self._apply_theme).pack(fill="x")
 
     def _build_editor_panel(self, parent: ttk.Frame) -> None:
         right_frame = ttk.Frame(parent)
@@ -546,25 +547,18 @@ class ThemeEditorDialog(tk.Toplevel):
 
         ttk.Radiobutton(
             mode_frame,
-            text="Sample from screen",
+            text="Color Picker",
             variable=self.picker_mode,
             value="screen",
             command=self._show_picker_mode,
         ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
         ttk.Radiobutton(
             mode_frame,
-            text="Gradient box",
-            variable=self.picker_mode,
-            value="gradient",
-            command=self._show_picker_mode,
-        ).grid(row=0, column=1, sticky="w", padx=8, pady=6)
-        ttk.Radiobutton(
-            mode_frame,
             text="Hex code",
             variable=self.picker_mode,
             value="hex",
             command=self._show_picker_mode,
-        ).grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        ).grid(row=0, column=1, sticky="w", padx=8, pady=6)
 
         self.mode_container = ttk.Frame(picker_panel)
         self.mode_container.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
@@ -572,7 +566,6 @@ class ThemeEditorDialog(tk.Toplevel):
 
         self.mode_frames: dict[str, ttk.Frame] = {}
         self._build_screen_picker(self.mode_container)
-        self._build_gradient_picker(self.mode_container)
         self._build_hex_picker(self.mode_container)
         self._show_picker_mode()
 
@@ -597,19 +590,10 @@ class ThemeEditorDialog(tk.Toplevel):
             text="Use the system color picker to sample a color from anywhere on screen.",
             wraplength=520,
         ).grid(row=0, column=0, sticky="w")
-        ttk.Button(frame, text="Pick Screen Color", command=self._pick_screen_color).grid(
+        ttk.Button(frame, text="Pick Color", command=self._pick_screen_color).grid(
             row=1, column=0, sticky="w", pady=(8, 0)
         )
         self.mode_frames["screen"] = frame
-
-    def _build_gradient_picker(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        ttk.Label(frame, text="Click the gradient to choose a color.").pack(anchor="w")
-        self.gradient_canvas = tk.Canvas(frame, width=320, height=140, highlightthickness=1)
-        self.gradient_canvas.pack(pady=(8, 0))
-        self.gradient_canvas.bind("<Button-1>", self._select_gradient_color)
-        self._draw_gradient()
-        self.mode_frames["gradient"] = frame
 
     def _build_hex_picker(self, parent: ttk.Frame) -> None:
         frame = ttk.Frame(parent)
@@ -621,19 +605,6 @@ class ThemeEditorDialog(tk.Toplevel):
             row=0, column=2, sticky="w", padx=(8, 0)
         )
         self.mode_frames["hex"] = frame
-
-    def _draw_gradient(self) -> None:
-        width = int(self.gradient_canvas["width"])
-        height = int(self.gradient_canvas["height"])
-        self.gradient_image = tk.PhotoImage(width=width, height=height)
-        for x in range(width):
-            hue = x / max(width - 1, 1)
-            for y in range(height):
-                value = 1 - (y / max(height - 1, 1)) * 0.4
-                red, green, blue = colorsys.hsv_to_rgb(hue, 1.0, value)
-                hex_color = f"#{int(red*255):02x}{int(green*255):02x}{int(blue*255):02x}"
-                self.gradient_image.put(hex_color, (x, y))
-        self.gradient_canvas.create_image(0, 0, anchor="nw", image=self.gradient_image)
 
     def _show_picker_mode(self) -> None:
         for frame in self.mode_frames.values():
@@ -679,15 +650,6 @@ class ThemeEditorDialog(tk.Toplevel):
         if result and result[1]:
             self._set_current_color(result[1])
 
-    def _select_gradient_color(self, event: tk.Event) -> None:
-        width = int(self.gradient_canvas["width"])
-        height = int(self.gradient_canvas["height"])
-        hue = max(0, min(event.x, width - 1)) / max(width - 1, 1)
-        value = 1 - (max(0, min(event.y, height - 1)) / max(height - 1, 1)) * 0.4
-        red, green, blue = colorsys.hsv_to_rgb(hue, 1.0, value)
-        color = f"#{int(red*255):02x}{int(green*255):02x}{int(blue*255):02x}"
-        self._set_current_color(color)
-
     def _apply_hex_color(self) -> None:
         value = self.hex_entry.get().strip()
         if not value.startswith("#"):
@@ -729,6 +691,14 @@ class ThemeEditorDialog(tk.Toplevel):
             return
         messagebox.showinfo("Theme Editor", f"Theme '{theme_name}' saved.")
 
+    def _apply_theme(self) -> None:
+        theme_name = self.selected_theme_name.get()
+        if not theme_name:
+            return
+        theme = self.themes.get(theme_name, {})
+        if self.apply_theme_callback:
+            self.apply_theme_callback(theme)
+
 
 class MediaServerApp:
     def __init__(self, root: tk.Tk, db: LibraryDB) -> None:
@@ -736,6 +706,9 @@ class MediaServerApp:
         self.db = db
         self.root.title("Media Server Organizer")
         self.root.geometry("1200x720")
+        self.style = ttk.Style(self.root)
+        self.themes = self._load_themes()
+        self.current_theme = dict(self.themes.get("Default", DEFAULT_THEME))
 
         self.library_tabs: dict[int, ttk.Frame] = {}
         self.library_views: dict[int, ttk.Treeview] = {}
@@ -744,6 +717,7 @@ class MediaServerApp:
 
         self._build_menu()
         self._build_layout()
+        self._apply_theme(self.current_theme)
         self._load_libraries()
 
     def _build_menu(self) -> None:
@@ -777,17 +751,38 @@ class MediaServerApp:
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menu)
 
+    def _load_themes(self) -> dict[str, dict[str, str]]:
+        themes: dict[str, dict[str, str]] = {}
+        themes_dir = Path(__file__).resolve().parent / "themes"
+        if themes_dir.is_dir():
+            for theme_path in sorted(themes_dir.glob("*.json")):
+                try:
+                    data = json.loads(theme_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                theme_name = theme_path.stem.replace("_", " ").title()
+                themes[theme_name] = {key: str(value) for key, value in data.items()}
+        if "Default" not in themes:
+            themes["Default"] = dict(DEFAULT_THEME)
+        if "Default" in themes:
+            themes = {"Default": themes.pop("Default"), **themes}
+        return themes
+
     def _build_layout(self) -> None:
         main_pane = ttk.PanedWindow(self.root, orient="horizontal")
         main_pane.pack(fill="both", expand=True)
 
-        left_frame = ttk.Frame(main_pane, width=280)
-        left_frame.columnconfigure(0, weight=1)
-        left_frame.rowconfigure(0, weight=1)
-        left_frame.rowconfigure(1, weight=0)
+        self.left_frame = ttk.Frame(main_pane, width=280, style="Sidebar.TFrame")
+        self.left_frame.columnconfigure(0, weight=1)
+        self.left_frame.rowconfigure(0, weight=1)
+        self.left_frame.rowconfigure(1, weight=0)
 
-        self.folder_tree = ttk.Treeview(left_frame, show="tree")
-        folder_scroll = ttk.Scrollbar(left_frame, orient="vertical", command=self.folder_tree.yview)
+        self.folder_tree = ttk.Treeview(self.left_frame, show="tree", style="Sidebar.Treeview")
+        folder_scroll = ttk.Scrollbar(
+            self.left_frame, orient="vertical", command=self.folder_tree.yview
+        )
         self.folder_tree.configure(yscrollcommand=folder_scroll.set)
         self.folder_tree.grid(row=0, column=0, sticky="nsew")
         folder_scroll.grid(row=0, column=1, sticky="ns")
@@ -795,7 +790,9 @@ class MediaServerApp:
         self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_tree_selected)
         self.folder_tree.bind("<Double-1>", self._on_folder_tree_double_click)
 
-        self.metadata_frame = ttk.Labelframe(left_frame, text="File Metadata", padding=8)
+        self.metadata_frame = ttk.Labelframe(
+            self.left_frame, text="File Metadata", padding=8, style="Metadata.TLabelframe"
+        )
         self.metadata_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         self.metadata_frame.columnconfigure(0, weight=1)
         self.metadata_frame.rowconfigure(0, weight=1)
@@ -808,7 +805,7 @@ class MediaServerApp:
         self.metadata_canvas.grid(row=0, column=0, sticky="nsew")
         self.metadata_scroll.grid(row=0, column=1, sticky="ns")
 
-        self.metadata_content = ttk.Frame(self.metadata_canvas)
+        self.metadata_content = ttk.Frame(self.metadata_canvas, style="Metadata.TFrame")
         self.metadata_content.columnconfigure(1, weight=1)
         self.metadata_window = self.metadata_canvas.create_window(
             (0, 0), window=self.metadata_content, anchor="nw"
@@ -820,19 +817,19 @@ class MediaServerApp:
             "<Configure>", lambda event: self.metadata_canvas.itemconfig(self.metadata_window, width=event.width)
         )
 
-        right_frame = ttk.Frame(main_pane)
-        right_frame.columnconfigure(0, weight=1)
-        right_frame.rowconfigure(0, weight=1)
+        self.right_frame = ttk.Frame(main_pane)
+        self.right_frame.columnconfigure(0, weight=1)
+        self.right_frame.rowconfigure(0, weight=1)
 
-        self.notebook = ttk.Notebook(right_frame)
+        self.notebook = ttk.Notebook(self.right_frame)
         self.notebook.grid(row=0, column=0, sticky="nsew")
         self.notebook.bind("<<NotebookTabChanged>>", self._handle_tab_changed)
 
         self.new_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.new_tab, text="+")
 
-        main_pane.add(left_frame, weight=1)
-        main_pane.add(right_frame, weight=4)
+        main_pane.add(self.left_frame, weight=1)
+        main_pane.add(self.right_frame, weight=4)
 
     def _load_libraries(self) -> None:
         for library in self.db.fetch_libraries():
@@ -867,7 +864,7 @@ class MediaServerApp:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        tree = ttk.Treeview(frame, columns=("type", "location"), show="headings")
+        tree = ttk.Treeview(frame, columns=("type", "location"), show="headings", style="Library.Treeview")
         tree.heading("type", text="Type")
         tree.heading("location", text="Location")
         tree.column("type", width=120, anchor="w")
@@ -1095,7 +1092,66 @@ class MediaServerApp:
             subprocess.run(["xdg-open", path], check=False)
 
     def _open_theme_dialog(self) -> None:
-        ThemeEditorDialog(self.root)
+        ThemeEditorDialog(self.root, self.themes, self._apply_theme)
+
+    def _apply_theme(self, theme: dict[str, str]) -> None:
+        self.current_theme = dict(theme)
+        window_bg = theme.get("window_background", self.root.cget("bg"))
+        sidebar_bg = theme.get("sidebar_background", window_bg)
+        toolbar_bg = theme.get("toolbar_background", window_bg)
+        tree_bg = theme.get("treeview_background", "white")
+        metadata_bg = theme.get("metadata_background", window_bg)
+        accent = theme.get("accent_color", "#3b74ff")
+        text_color = theme.get("text_color", "black")
+
+        self.root.configure(background=window_bg)
+        self.style.configure("TFrame", background=window_bg)
+        self.style.configure("Sidebar.TFrame", background=sidebar_bg)
+        self.style.configure("Metadata.TFrame", background=metadata_bg)
+        self.style.configure("TLabel", background=window_bg, foreground=text_color)
+        self.style.configure("Sidebar.TLabel", background=sidebar_bg, foreground=text_color)
+        self.style.configure("Metadata.TLabel", background=metadata_bg, foreground=text_color)
+        self.style.configure("TLabelframe", background=window_bg, foreground=text_color)
+        self.style.configure(
+            "TLabelframe.Label", background=window_bg, foreground=text_color
+        )
+        self.style.configure(
+            "Metadata.TLabelframe", background=metadata_bg, foreground=text_color
+        )
+        self.style.configure(
+            "Metadata.TLabelframe.Label", background=metadata_bg, foreground=text_color
+        )
+        self.style.configure(
+            "Treeview",
+            background=tree_bg,
+            fieldbackground=tree_bg,
+            foreground=text_color,
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=toolbar_bg,
+            foreground=text_color,
+        )
+        self.style.configure(
+            "Sidebar.Treeview",
+            background=tree_bg,
+            fieldbackground=tree_bg,
+            foreground=text_color,
+        )
+        self.style.configure(
+            "Library.Treeview",
+            background=tree_bg,
+            fieldbackground=tree_bg,
+            foreground=text_color,
+        )
+        self.style.configure(
+            "Accent.TButton",
+            background=accent,
+            foreground=text_color,
+        )
+
+        if hasattr(self, "metadata_canvas"):
+            self.metadata_canvas.configure(background=metadata_bg)
 
     def _show_placeholder(self, title: str) -> None:
         messagebox.showinfo(title, f"{title} options will be available in a future update.")
@@ -1112,11 +1168,15 @@ class MediaServerApp:
         if not rows:
             rows = [("Metadata", "—")]
         for index, (label, value) in enumerate(rows):
-            ttk.Label(self.metadata_content, text=f"{label}:").grid(
+            ttk.Label(self.metadata_content, text=f"{label}:", style="Metadata.TLabel").grid(
                 row=index, column=0, sticky="nw", padx=(0, 8), pady=2
             )
             value_label = ttk.Label(
-                self.metadata_content, text=value or "—", wraplength=240, justify="left"
+                self.metadata_content,
+                text=value or "—",
+                wraplength=240,
+                justify="left",
+                style="Metadata.TLabel",
             )
             value_label.grid(row=index, column=1, sticky="w", pady=2)
 
