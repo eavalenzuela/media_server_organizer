@@ -700,6 +700,106 @@ class ThemeEditorDialog(tk.Toplevel):
             self.apply_theme_callback(theme)
 
 
+class WorkflowsDialog(tk.Toplevel):
+    def __init__(self, master: tk.Tk) -> None:
+        super().__init__(master)
+        self.title("Workflows")
+        self.geometry("860x520")
+        self.resizable(False, False)
+
+        self.workflow_names = self._load_workflows()
+        self.description_var = tk.StringVar(value="Select a workflow to see details.")
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(sticky="nsew")
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        ttk.Label(container, text="Workflows").grid(row=0, column=0, sticky="w")
+        ttk.Label(container, text="Workflow description").grid(row=0, column=1, sticky="w")
+
+        list_frame = ttk.Frame(container)
+        list_frame.grid(row=1, column=0, rowspan=2, sticky="nsw", padx=(0, 16))
+        self.workflow_list = tk.Listbox(list_frame, height=18, width=26, exportselection=False)
+        list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.workflow_list.yview)
+        self.workflow_list.configure(yscrollcommand=list_scroll.set)
+        self.workflow_list.grid(row=0, column=0, sticky="ns")
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.workflow_list.bind("<<ListboxSelect>>", self._on_workflow_selected)
+
+        description_frame = ttk.Frame(container)
+        description_frame.grid(row=1, column=1, sticky="ew")
+        description_frame.columnconfigure(0, weight=1)
+        description_label = ttk.Label(
+            description_frame,
+            textvariable=self.description_var,
+            wraplength=520,
+            justify="left",
+        )
+        description_label.grid(row=0, column=0, sticky="w")
+
+        self.run_button = ttk.Button(description_frame, text="Run Workflow", command=self._run_workflow)
+        self.run_button.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        preview_frame = ttk.Labelframe(container, text="Workflow preview", padding=12)
+        preview_frame.grid(row=2, column=1, sticky="nsew", pady=(12, 0))
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+        ttk.Label(preview_frame, text="Visual diagram of the workflow").grid(
+            row=0, column=0, sticky="nsew"
+        )
+
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=3, column=1, sticky="e", pady=(12, 0))
+        ttk.Button(button_frame, text="Close", command=self.destroy).pack(side="right")
+
+        self._populate_workflows()
+        self._update_run_state()
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _load_workflows(self) -> list[str]:
+        workflows_dir = Path(__file__).resolve().parent / "workflows"
+        if not workflows_dir.is_dir():
+            return []
+        return sorted(
+            path.name for path in workflows_dir.iterdir() if path.is_dir() and not path.name.startswith(".")
+        )
+
+    def _populate_workflows(self) -> None:
+        self.workflow_list.delete(0, tk.END)
+        if not self.workflow_names:
+            self.workflow_list.insert(tk.END, "No workflows available yet.")
+            self.workflow_list.configure(state="disabled")
+            return
+        for name in self.workflow_names:
+            self.workflow_list.insert(tk.END, name)
+
+    def _on_workflow_selected(self, _event: tk.Event) -> None:
+        if not self.workflow_names:
+            return
+        selection = self.workflow_list.curselection()
+        if not selection:
+            self.description_var.set("Select a workflow to see details.")
+            self._update_run_state()
+            return
+        selected_name = self.workflow_list.get(selection[0])
+        self.description_var.set(f"{selected_name} workflow details will appear here.")
+        self._update_run_state()
+
+    def _update_run_state(self) -> None:
+        has_selection = bool(self.workflow_list.curselection()) and bool(self.workflow_names)
+        self.run_button.configure(state="normal" if has_selection else "disabled")
+
+    def _run_workflow(self) -> None:
+        messagebox.showinfo(
+            "Workflows",
+            "Workflows will be available in a future update.",
+            parent=self,
+        )
+
+
 class MediaServerApp:
     def __init__(self, root: tk.Tk, db: LibraryDB) -> None:
         self.root = root
@@ -731,6 +831,8 @@ class MediaServerApp:
         menu.add_cascade(label="File", menu=file_menu)
 
         view_menu = tk.Menu(menu, tearoff=0)
+        view_menu.add_command(label="Workflows...", command=self._open_workflows_dialog)
+        view_menu.add_separator()
         view_menu.add_command(label="Refresh Library", command=self._refresh_current_library)
         view_menu.add_command(label="Refresh Folder Tree", command=self._refresh_folder_tree)
         view_menu.add_separator()
@@ -858,6 +960,10 @@ class MediaServerApp:
         dialog = LibraryManagementDialog(self.root, self.db)
         self.root.wait_window(dialog)
         self._sync_libraries()
+
+    def _open_workflows_dialog(self) -> None:
+        dialog = WorkflowsDialog(self.root)
+        self.root.wait_window(dialog)
 
     def _create_library_tab(self, library: Library) -> None:
         frame = ttk.Frame(self.notebook)
