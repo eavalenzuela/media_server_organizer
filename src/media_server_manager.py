@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -25,6 +26,23 @@ DEFAULT_THEME = {
     "accent_color": "SystemHighlight",
     "text_color": "SystemWindowText",
 }
+
+
+def load_workflow_runner(workflow_name: str) -> object | None:
+    workflows_dir = Path(__file__).resolve().parent / "workflows"
+    runner_path = workflows_dir / workflow_name / "runner.py"
+    if not runner_path.exists():
+        return None
+    module_name = f"workflows.{workflow_name}.runner"
+    spec = importlib.util.spec_from_file_location(module_name, runner_path)
+    if not spec or not spec.loader:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    create_workflow = getattr(module, "create_workflow", None)
+    if callable(create_workflow):
+        return create_workflow()
+    return None
 
 
 @dataclass(frozen=True)
@@ -708,6 +726,9 @@ class WorkflowsDialog(tk.Toplevel):
         self.resizable(False, False)
 
         self.workflow_names = self._load_workflows()
+        self.workflow_runners = {
+            name: load_workflow_runner(name) for name in self.workflow_names
+        }
         self.description_var = tk.StringVar(value="Select a workflow to see details.")
 
         container = ttk.Frame(self, padding=12)
@@ -785,7 +806,12 @@ class WorkflowsDialog(tk.Toplevel):
             self._update_run_state()
             return
         selected_name = self.workflow_list.get(selection[0])
-        self.description_var.set(f"{selected_name} workflow details will appear here.")
+        runner = self.workflow_runners.get(selected_name)
+        description = getattr(runner, "description", None) if runner else None
+        if description:
+            self.description_var.set(description)
+        else:
+            self.description_var.set(f"{selected_name} workflow details will appear here.")
         self._update_run_state()
 
     def _update_run_state(self) -> None:
@@ -799,32 +825,43 @@ class WorkflowsDialog(tk.Toplevel):
         if not selection:
             return
         selected_name = self.workflow_list.get(selection[0])
-        WorkflowProcessWizard(self, selected_name).open_options()
+        runner = self.workflow_runners.get(selected_name)
+        if not runner:
+            messagebox.showerror(
+                "Workflow Error",
+                "Unable to load the selected workflow runner.",
+                parent=self,
+            )
+            return
+        WorkflowProcessWizard(self, selected_name, runner).open_options()
 
 
 class WorkflowProcessWizard:
-    def __init__(self, master: tk.Toplevel, workflow_name: str) -> None:
+    def __init__(self, master: tk.Toplevel, workflow_name: str, runner: object) -> None:
         self.master = master
         self.workflow_name = workflow_name
+        self.runner = runner
         self._options_modal: WorkflowProcessModal | None = None
         self._preview_modal: WorkflowProcessModal | None = None
         self._review_modal: WorkflowProcessModal | None = None
+        self._option_definitions: list[tuple[str, str]] = []
+        self._options: dict[str, str] = {}
+        self._plan: object | None = None
+        self._rollback_script: Path | None = None
+        self._rollback_powershell_script: Path | None = None
 
     def open_options(self) -> None:
         if self._options_modal:
             self._options_modal.destroy()
+        option_definitions = getattr(self.runner, "option_definitions")()
+        self._option_definitions = [(option.key, option.label) for option in option_definitions]
+        list_items = [(option.label, option.value) for option in option_definitions]
         self._options_modal = WorkflowProcessModal(
             master=self.master,
             title="Workflow Options",
             header=f"{self.workflow_name} workflow options",
             list_title="Options",
-            list_items=[
-                ("Sort order", "Alphabetical"),
-                ("Rename pattern", "{title} ({year})"),
-                ("Missing metadata", "Skip items"),
-                ("Output directory", "~/Media/Processed"),
-                ("Overwrite existing", "Disabled"),
-            ],
+            list_items=list_items,
             editable=True,
             buttons=[
                 ("Back", self._close_options),
@@ -839,8 +876,20 @@ class WorkflowProcessWizard:
 
     def _open_preview(self) -> None:
         if self._options_modal:
+            self._options = self._options_modal.get_option_values(self._option_definitions)
             self._options_modal.destroy()
             self._options_modal = None
+        try:
+            self._plan = getattr(self.runner, "build_plan")(self._options)
+            preview_items = getattr(self.runner, "preview_items")(self._plan)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Workflow Error",
+                f"Unable to build preview: {exc}",
+                parent=self.master,
+            )
+            self.open_options()
+            return
         if self._preview_modal:
             self._preview_modal.destroy()
         self._preview_modal = WorkflowProcessModal(
@@ -848,12 +897,7 @@ class WorkflowProcessWizard:
             title="Preview Changes",
             header=f"{self.workflow_name} preview changes",
             list_title="Planned changes",
-            list_items=[
-                ("Rename files", "14 items"),
-                ("Move folders", "6 items"),
-                ("Update metadata", "9 items"),
-                ("Skip items", "2 items"),
-            ],
+            list_items=preview_items,
             editable=False,
             buttons=[
                 ("Back", self._back_to_options),
@@ -873,17 +917,27 @@ class WorkflowProcessWizard:
             self._preview_modal = None
         if self._review_modal:
             self._review_modal.destroy()
+        try:
+            if self._plan is None:
+                raise ValueError("No preview plan available.")
+            result = getattr(self.runner, "apply")(self._options, self._plan)
+            self._rollback_script = getattr(result, "rollback_script", None)
+            self._rollback_powershell_script = getattr(result, "rollback_powershell_script", None)
+            review_items = getattr(result, "summary_items", [])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Workflow Error",
+                f"Unable to apply changes: {exc}",
+                parent=self.master,
+            )
+            self.open_options()
+            return
         self._review_modal = WorkflowProcessModal(
             master=self.master,
             title="Review Changes",
             header=f"{self.workflow_name} results",
             list_title="Completed changes",
-            list_items=[
-                ("Renamed files", "14 succeeded"),
-                ("Moved folders", "6 succeeded"),
-                ("Metadata updates", "9 succeeded"),
-                ("Errors", "0"),
-            ],
+            list_items=review_items,
             editable=False,
             buttons=[
                 ("Rollback", self._rollback),
@@ -893,11 +947,22 @@ class WorkflowProcessWizard:
 
     def _rollback(self) -> None:
         if self._review_modal:
-            messagebox.showinfo(
-                "Rollback",
-                "Rollback will be available in a future update.",
-                parent=self._review_modal,
-            )
+            rollback_script = self._select_rollback_script()
+            if not rollback_script:
+                messagebox.showinfo(
+                    "Rollback",
+                    "No rollback script was generated for this run.",
+                    parent=self._review_modal,
+                )
+                return
+            result = getattr(self.runner, "rollback")(rollback_script)
+            summary_items = getattr(result, "summary_items", [("Rollback", "Completed")])
+            self._review_modal.update_list(summary_items)
+
+    def _select_rollback_script(self) -> Path | None:
+        if os.name == "nt" and self._rollback_powershell_script:
+            return self._rollback_powershell_script
+        return self._rollback_script
 
     def _finish_review(self) -> None:
         if self._review_modal:
@@ -1013,6 +1078,21 @@ class WorkflowProcessModal(tk.Toplevel):
         self._edit_entry = None
         self._edit_item = None
         self._edit_column = None
+
+    def get_option_values(self, definitions: list[tuple[str, str]]) -> dict[str, str]:
+        label_to_key = {label: key for key, label in definitions}
+        values: dict[str, str] = {}
+        for item in self.list_view.get_children():
+            name, value = self.list_view.item(item, "values")
+            key = label_to_key.get(name, name)
+            values[key] = value
+        return values
+
+    def update_list(self, list_items: list[tuple[str, str]]) -> None:
+        for item in self.list_view.get_children():
+            self.list_view.delete(item)
+        for name, value in list_items:
+            self.list_view.insert("", "end", values=(name, value))
 
 
 class MediaServerApp:
