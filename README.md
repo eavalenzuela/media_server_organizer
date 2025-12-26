@@ -11,8 +11,9 @@ Media Server Organizer is a desktop GUI for organizing the files and folders of 
 - **Folder tree sidebar** for local libraries, with expand/collapse and navigation on double-click.
 - **Metadata panel** that surfaces basic file details and media info (via `ffprobe` when available).
 - **Theme editor** to customize UI colors and save theme presets.
+- **Built-in playback** with audio controls (play/pause/stop, progress, volume) and video launchers from the library or folder tree.
+- **Workflow dialog** with runnable workflows (library merge and library cleaner) that collect options, preview planned moves, and write rollback scripts and logs after applying changes.
 - **CLI options** for database location and headless mode (`--db`, `--nogui`).
-- **Workflows dialog** is present, but workflow execution is not implemented yet.
 
 ## Goals
 - Organize files into existing, user-defined folder layouts without forcing a new structure.
@@ -30,11 +31,3 @@ python src/media_server_manager.py
 python src/media_server_manager.py --db /path/to/media.db
 python src/media_server_manager.py --nogui
 ```
-
-## Next ideas
-- Guided organize flow with preview + apply steps.
-- Library profiles (base paths, folder patterns, allowed extensions).
-- Dry-run + undo history for recent operations.
-- Cleanup tools (empty folder removal, stray file detection, duplicate audits).
-- Batch rename helpers for common naming patterns.
-- Import staging area for reviewing new drops.
