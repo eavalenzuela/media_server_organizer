@@ -1951,6 +1951,19 @@ class MediaServerApp:
         self._schedule_audio_progress()
         self._toggle_audio_player(True)
 
+    def _handle_playback_exception(self, exc: Exception) -> None:
+        messagebox.showerror("Play Audio", f"Playback error: {exc}")
+        self._stop_audio(suppress_errors=True)
+
+    def _play_object_is_playing(self) -> bool:
+        if not self.audio_play_obj:
+            return False
+        try:
+            return self.audio_play_obj.is_playing()
+        except Exception as exc:
+            self._handle_playback_exception(exc)
+            return False
+
     def _resume_or_restart_audio(self) -> None:
         if not self.audio_path:
             messagebox.showinfo("Play Audio", "Select an audio file to play.")
@@ -1966,21 +1979,34 @@ class MediaServerApp:
             return
         if self.audio_playback_start_time is None:
             return
-        if self.audio_play_obj.is_playing():
+        try:
+            playing = self.audio_play_obj.is_playing()
+        except Exception as exc:
+            self._handle_playback_exception(exc)
+            return
+        if playing:
             elapsed = int((time.time() - self.audio_playback_start_time) * 1000)
             self.audio_paused_position_ms = min(
                 self.audio_paused_position_ms + elapsed, self._current_audio_duration()
             )
-            self.audio_play_obj.stop()
+            try:
+                self.audio_play_obj.stop()
+            except Exception as exc:
+                self._handle_playback_exception(exc)
+                return
             self.audio_play_obj = None
             self.audio_playback_start_time = None
             self.audio_is_paused = True
             self._update_audio_time_display()
 
-    def _stop_audio(self) -> None:
+    def _stop_audio(self, suppress_errors: bool = False) -> None:
         if self.audio_play_obj:
-            self.audio_play_obj.stop()
-        self.audio_play_obj = None
+            try:
+                self.audio_play_obj.stop()
+            except Exception as exc:
+                if not suppress_errors:
+                    messagebox.showerror("Play Audio", f"Playback error: {exc}")
+            self.audio_play_obj = None
         self.audio_playback_start_time = None
         self.audio_paused_position_ms = 0
         self.audio_is_paused = False
@@ -2005,7 +2031,7 @@ class MediaServerApp:
 
     def _update_audio_progress(self) -> None:
         self._update_audio_time_display()
-        playing = self.audio_play_obj is not None and self.audio_play_obj.is_playing()
+        playing = self._play_object_is_playing()
         if playing:
             self._schedule_audio_progress()
             return
