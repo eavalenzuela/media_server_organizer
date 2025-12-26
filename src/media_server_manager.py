@@ -80,7 +80,82 @@ class LibraryDB:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS library_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                FOREIGN KEY (library_id) REFERENCES libraries(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_library_items_lookup
+            ON library_items(library_id, name, path)
+            """
+        )
         self.connection.commit()
+
+    def clear_library_items(self, library_id: int) -> None:
+        cursor = self.connection.cursor()
+        cursor.execute("DELETE FROM library_items WHERE library_id = ?", (library_id,))
+        self.connection.commit()
+
+    def index_library_items(self, library: Library, max_records: int = 50000) -> None:
+        if library.library_type != "local" or not os.path.isdir(library.path):
+            return
+        self.clear_library_items(library.library_id)
+        cursor = self.connection.cursor()
+        records_inserted = 0
+        for root, dirs, files in os.walk(library.path):
+            for folder_name in dirs:
+                if records_inserted >= max_records:
+                    break
+                full_path = os.path.join(root, folder_name)
+                cursor.execute(
+                    """
+                    INSERT INTO library_items (library_id, path, name, entry_type)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (library.library_id, full_path, folder_name, "Folder"),
+                )
+                records_inserted += 1
+            if records_inserted >= max_records:
+                break
+            for file_name in files:
+                if records_inserted >= max_records:
+                    break
+                full_path = os.path.join(root, file_name)
+                cursor.execute(
+                    """
+                    INSERT INTO library_items (library_id, path, name, entry_type)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (library.library_id, full_path, file_name, "File"),
+                )
+                records_inserted += 1
+            if records_inserted >= max_records:
+                break
+        self.connection.commit()
+
+    def search_items(self, term: str, limit: int = 200) -> list[tuple[int, str, str, str]]:
+        cursor = self.connection.cursor()
+        like_term = f"%{term.lower()}%"
+        cursor.execute(
+            """
+            SELECT library_id, path, name, entry_type
+            FROM library_items
+            WHERE lower(name) LIKE ? OR lower(path) LIKE ?
+            ORDER BY name
+            LIMIT ?
+            """,
+            (like_term, like_term, limit),
+        )
+        return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
 
     def fetch_libraries(self) -> list[Library]:
         cursor = self.connection.cursor()
@@ -1125,6 +1200,9 @@ class MediaServerApp:
         self.audio_title_var = tk.StringVar(value="No audio loaded")
         self.audio_time_var = tk.StringVar(value="00:00 / 00:00")
         self.audio_volume = tk.DoubleVar(value=100.0)
+        self.search_var = tk.StringVar()
+        self.search_status_var = tk.StringVar(value="Enter a term to search all libraries.")
+        self.indexed_libraries: set[int] = set()
         self.library_context_menu = tk.Menu(self.root, tearoff=0)
         self.library_context_menu.add_command(
             label="Play Video", command=self._play_selected_library_video
@@ -1247,24 +1325,70 @@ class MediaServerApp:
 
         self.right_frame = ttk.Frame(main_pane)
         self.right_frame.columnconfigure(0, weight=1)
-        self.right_frame.rowconfigure(0, weight=1)
-        self.right_frame.rowconfigure(1, weight=0)
+        self.right_frame.rowconfigure(1, weight=2)
+        self.right_frame.rowconfigure(2, weight=1)
+        self.right_frame.rowconfigure(3, weight=0)
+
+        self._build_toolbar()
 
         self.notebook = ttk.Notebook(self.right_frame)
-        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.notebook.grid(row=1, column=0, sticky="nsew")
         self.notebook.bind("<<NotebookTabChanged>>", self._handle_tab_changed)
 
         self.new_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.new_tab, text="+")
 
+        self._build_search_results()
         self._build_audio_player()
 
         main_pane.add(self.left_frame, weight=1)
         main_pane.add(self.right_frame, weight=4)
 
+    def _build_toolbar(self) -> None:
+        toolbar = ttk.Frame(self.right_frame, padding=(8, 6))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(1, weight=1)
+
+        ttk.Label(toolbar, text="Search").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        search_entry = ttk.Entry(toolbar, textvariable=self.search_var)
+        search_entry.grid(row=0, column=1, sticky="ew")
+        search_entry.bind("<Return>", lambda _event: self._perform_search())
+        ttk.Button(toolbar, text="Go", command=self._perform_search).grid(
+            row=0, column=2, padx=(6, 0)
+        )
+
+        self.search_status = ttk.Label(toolbar, textvariable=self.search_status_var, anchor="w")
+        self.search_status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+
+    def _build_search_results(self) -> None:
+        frame = ttk.Labelframe(self.right_frame, text="Search Results", padding=6)
+        frame.grid(row=2, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.search_results = ttk.Treeview(
+            frame,
+            columns=("library", "type", "path"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        self.search_results.heading("library", text="Library")
+        self.search_results.heading("type", text="Type")
+        self.search_results.heading("path", text="Path")
+        self.search_results.column("library", width=140, anchor="w")
+        self.search_results.column("type", width=80, anchor="w")
+        self.search_results.column("path", width=420, anchor="w")
+        self.search_results.grid(row=0, column=0, sticky="nsew")
+
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.search_results.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.search_results.configure(yscrollcommand=scroll.set)
+        self.search_results.bind("<Double-1>", self._open_search_result)
+
     def _build_audio_player(self) -> None:
         self.audio_player_frame = ttk.Frame(self.right_frame, padding=(8, 6))
-        self.audio_player_frame.grid(row=1, column=0, sticky="ew")
+        self.audio_player_frame.grid(row=3, column=0, sticky="ew")
         self.audio_player_frame.columnconfigure(1, weight=1)
 
         ttk.Label(self.audio_player_frame, text="Now Playing:", style="Metadata.TLabel").grid(
@@ -1310,6 +1434,7 @@ class MediaServerApp:
             first_library = next(iter(self.library_tabs))
             self.notebook.select(self.library_tabs[first_library])
             self._set_current_library(self.db.fetch_libraries()[0])
+        self._refresh_search_index(force=False)
 
     def _open_new_library_dialog(self) -> None:
         dialog = NewLibraryDialog(self.root)
@@ -1413,6 +1538,88 @@ class MediaServerApp:
             full_path = os.path.join(path, entry)
             entry_type = "Folder" if os.path.isdir(full_path) else "File"
             tree.insert("", "end", values=(entry_type, full_path))
+        self._refresh_search_index(force=False)
+
+    def _refresh_search_index(self, force: bool) -> None:
+        for library in self.db.fetch_libraries():
+            if not force and library.library_id in self.indexed_libraries:
+                continue
+            try:
+                self.db.index_library_items(library)
+                self.indexed_libraries.add(library.library_id)
+            except Exception as exc:
+                self.search_status_var.set(f"Indexing failed for {library.name}: {exc}")
+
+    def _perform_search(self) -> None:
+        term = self.search_var.get().strip()
+        for item in self.search_results.get_children():
+            self.search_results.delete(item)
+        if not term:
+            self.search_status_var.set("Enter a term to search all libraries.")
+            return
+        self.search_status_var.set("Indexing libraries...")
+        self.root.update_idletasks()
+        self._refresh_search_index(force=False)
+        self.search_status_var.set("Searching...")
+        try:
+            results = self.db.search_items(term)
+        except Exception as exc:
+            self.search_status_var.set(f"Search failed: {exc}")
+            return
+
+        library_lookup = {lib.library_id: lib for lib in self.db.fetch_libraries()}
+        for library_id, path, name, entry_type in results:
+            library_name = library_lookup.get(
+                library_id, Library(0, "Unknown", "local", "", None, None)
+            ).name
+            self.search_results.insert(
+                "",
+                "end",
+                values=(library_name, entry_type, path),
+                tags=(str(library_id),),
+            )
+        if results:
+            self.search_status_var.set(f"Found {len(results)} matches for '{term}'.")
+        else:
+            self.search_status_var.set(f"No results for '{term}'.")
+
+    def _open_search_result(self, _event: tk.Event) -> None:
+        selection = self.search_results.selection()
+        if not selection:
+            return
+        item_id = selection[0]
+        values = self.search_results.item(item_id, "values")
+        tags = self.search_results.item(item_id, "tags")
+        if len(values) < 3 or not tags:
+            return
+        library_id = int(tags[0])
+        path = values[2]
+        self._navigate_to_search_result(library_id, path)
+
+    def _navigate_to_search_result(self, library_id: int, path: str) -> None:
+        library = next((lib for lib in self.db.fetch_libraries() if lib.library_id == library_id), None)
+        if not library:
+            messagebox.showerror("Search", "Library for this result no longer exists.")
+            return
+        if library.library_id not in self.library_tabs:
+            self._create_library_tab(library)
+        self.notebook.select(self.library_tabs[library.library_id])
+        self._set_current_library(library)
+
+        if library.library_type != "local":
+            return
+
+        target_dir = path if os.path.isdir(path) else os.path.dirname(path)
+        if target_dir and os.path.isdir(target_dir):
+            self.library_paths[library.library_id] = target_dir
+            self._populate_library_view(library, target_dir)
+            tree = self.library_views[library.library_id]
+            for item in tree.get_children():
+                item_values = tree.item(item, "values")
+                if len(item_values) >= 2 and os.path.abspath(item_values[1]) == os.path.abspath(path):
+                    tree.selection_set(item)
+                    tree.see(item)
+                    break
 
     def _handle_tab_changed(self, _event: tk.Event) -> None:
         selected = self.notebook.select()
@@ -1438,6 +1645,7 @@ class MediaServerApp:
         self._populate_library_view(library, self.library_paths[library.library_id])
         self._refresh_folder_tree()
         self._clear_metadata()
+        self._refresh_search_index(force=False)
 
     def _refresh_current_library(self) -> None:
         if not self.current_library:
@@ -1447,6 +1655,7 @@ class MediaServerApp:
         )
         self._populate_library_view(self.current_library, current_path)
         self._refresh_folder_tree()
+        self._refresh_search_index(force=True)
 
     def _refresh_folder_tree(self) -> None:
         for item in self.folder_tree.get_children():
