@@ -1810,7 +1810,7 @@ class MediaServerApp:
         maximum = duration_ms if duration_ms > 0 else 1
         self.audio_progress.configure(maximum=maximum, value=min(elapsed_ms, maximum))
         self.audio_time_var.set(
-            f\"{self._format_milliseconds(elapsed_ms)} / {self._format_milliseconds(duration_ms)}\"
+            f"{self._format_milliseconds(elapsed_ms)} / {self._format_milliseconds(duration_ms)}"
         )
 
     def _current_audio_position_ms(self, duration_ms: int) -> int:
@@ -1829,8 +1829,8 @@ class MediaServerApp:
         minutes, seconds = divmod(seconds, 60)
         hours, minutes = divmod(minutes, 60)
         if hours:
-            return f\"{hours:d}:{minutes:02d}:{seconds:02d}\"
-        return f\"{minutes:02d}:{seconds:02d}\"
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _apply_volume(self, segment: AudioSegment) -> AudioSegment:
         volume = max(0.0, min(self.audio_volume.get(), 100.0))
