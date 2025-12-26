@@ -1,11 +1,13 @@
 import argparse
 import importlib.util
 import json
+import math
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +15,9 @@ from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+
+import simpleaudio
+from pydub import AudioSegment
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
@@ -1109,6 +1114,24 @@ class MediaServerApp:
         self.library_views: dict[int, ttk.Treeview] = {}
         self.library_paths: dict[int, str] = {}
         self.current_library: Library | None = None
+        self.audio_segment: AudioSegment | None = None
+        self.audio_segment_path: str | None = None
+        self.audio_play_obj: simpleaudio.PlayObject | None = None
+        self.audio_path: str | None = None
+        self.audio_paused_position_ms = 0
+        self.audio_playback_start_time: float | None = None
+        self.audio_progress_job: str | None = None
+        self.audio_is_paused = False
+        self.audio_title_var = tk.StringVar(value="No audio loaded")
+        self.audio_time_var = tk.StringVar(value="00:00 / 00:00")
+        self.audio_volume = tk.DoubleVar(value=100.0)
+        self.library_context_menu = tk.Menu(self.root, tearoff=0)
+        self.library_context_menu.add_command(
+            label="Play Video", command=self._play_selected_library_video
+        )
+        self.library_context_menu.add_command(
+            label="Play Audio", command=self._play_selected_library_audio
+        )
 
         self._build_menu()
         self._build_layout()
@@ -1186,6 +1209,14 @@ class MediaServerApp:
         self.folder_tree.bind("<<TreeviewOpen>>", self._expand_folder_node)
         self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_tree_selected)
         self.folder_tree.bind("<Double-1>", self._on_folder_tree_double_click)
+        self.folder_tree.bind("<Button-3>", self._show_folder_tree_menu)
+        self.folder_tree_menu = tk.Menu(self.folder_tree, tearoff=0)
+        self.folder_tree_menu.add_command(
+            label="Play Video", command=self._play_selected_folder_video
+        )
+        self.folder_tree_menu.add_command(
+            label="Play Audio", command=self._play_selected_folder_audio
+        )
 
         self.metadata_frame = ttk.Labelframe(
             self.left_frame, text="File Metadata", padding=8, style="Metadata.TLabelframe"
@@ -1217,6 +1248,7 @@ class MediaServerApp:
         self.right_frame = ttk.Frame(main_pane)
         self.right_frame.columnconfigure(0, weight=1)
         self.right_frame.rowconfigure(0, weight=1)
+        self.right_frame.rowconfigure(1, weight=0)
 
         self.notebook = ttk.Notebook(self.right_frame)
         self.notebook.grid(row=0, column=0, sticky="nsew")
@@ -1225,8 +1257,51 @@ class MediaServerApp:
         self.new_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.new_tab, text="+")
 
+        self._build_audio_player()
+
         main_pane.add(self.left_frame, weight=1)
         main_pane.add(self.right_frame, weight=4)
+
+    def _build_audio_player(self) -> None:
+        self.audio_player_frame = ttk.Frame(self.right_frame, padding=(8, 6))
+        self.audio_player_frame.grid(row=1, column=0, sticky="ew")
+        self.audio_player_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.audio_player_frame, text="Now Playing:", style="Metadata.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ttk.Label(self.audio_player_frame, textvariable=self.audio_title_var, style="Metadata.TLabel").grid(
+            row=0, column=1, sticky="w"
+        )
+
+        self.audio_progress = ttk.Progressbar(
+            self.audio_player_frame, mode="determinate", length=260, maximum=100
+        )
+        self.audio_progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        self.audio_time_label = ttk.Label(
+            self.audio_player_frame, textvariable=self.audio_time_var, style="Metadata.TLabel"
+        )
+        self.audio_time_label.grid(row=1, column=2, sticky="e", padx=(8, 0))
+
+        controls = ttk.Frame(self.audio_player_frame)
+        controls.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(controls, text="Play", command=self._resume_or_restart_audio).pack(side="left")
+        ttk.Button(controls, text="Pause", command=self._pause_audio).pack(side="left", padx=(6, 0))
+        ttk.Button(controls, text="Stop", command=self._stop_audio).pack(side="left", padx=(6, 0))
+
+        volume_frame = ttk.Frame(self.audio_player_frame)
+        volume_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(volume_frame, text="Volume", style="Metadata.TLabel").pack(side="left")
+        ttk.Scale(
+            volume_frame,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.audio_volume,
+            length=160,
+        ).pack(side="left", padx=(6, 0), fill="x", expand=True)
+        ttk.Label(volume_frame, text="%", style="Metadata.TLabel").pack(side="left", padx=(4, 0))
+        self._toggle_audio_player(False)
 
     def _load_libraries(self) -> None:
         for library in self.db.fetch_libraries():
@@ -1278,6 +1353,7 @@ class MediaServerApp:
 
         tree.bind("<<TreeviewSelect>>", self._on_library_item_selected)
         tree.bind("<Double-1>", self._on_library_item_double_click)
+        tree.bind("<Button-3>", self._show_library_item_menu)
 
         self.library_tabs[library.library_id] = frame
         self.library_views[library.library_id] = tree
@@ -1433,6 +1509,8 @@ class MediaServerApp:
         path = values[0]
         if os.path.isdir(path):
             self._navigate_to_path(path)
+        elif os.path.isfile(path):
+            self._handle_media_activation(path)
 
     def _on_library_item_selected(self, _event: tk.Event) -> None:
         if not self.current_library:
@@ -1456,6 +1534,8 @@ class MediaServerApp:
         entry_type, location = item["values"]
         if entry_type == "Folder" and os.path.isdir(location):
             self._navigate_to_path(location)
+        elif entry_type == "File" and os.path.isfile(location):
+            self._handle_media_activation(location)
 
     def _navigate_to_path(self, path: str) -> None:
         if not self.current_library or self.current_library.library_type != "local":
@@ -1475,6 +1555,97 @@ class MediaServerApp:
         for root in self.folder_tree.get_children(""):
             recurse(root)
 
+    def _show_folder_tree_menu(self, event: tk.Event) -> None:
+        item = self.folder_tree.identify_row(event.y)
+        if item:
+            self.folder_tree.selection_set(item)
+            self.folder_tree.focus(item)
+        self._update_folder_menu_state()
+        try:
+            self.folder_tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.folder_tree_menu.grab_release()
+
+    def _show_library_item_menu(self, event: tk.Event) -> None:
+        if not self.current_library:
+            return
+        tree = self.library_views[self.current_library.library_id]
+        item = tree.identify_row(event.y)
+        if item:
+            tree.selection_set(item)
+            tree.focus(item)
+        self._update_library_menu_state()
+        try:
+            self.library_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.library_context_menu.grab_release()
+
+    def _update_folder_menu_state(self) -> None:
+        path = self._get_selected_folder_path()
+        self._set_menu_state(self.folder_tree_menu, path)
+
+    def _update_library_menu_state(self) -> None:
+        entry = self._get_selected_library_item()
+        path = entry[1] if entry else None
+        self._set_menu_state(self.library_context_menu, path)
+
+    def _set_menu_state(self, menu: tk.Menu, path: str | None) -> None:
+        extension = os.path.splitext(path)[1].lower() if path else ""
+        menu.entryconfigure(
+            "Play Video", state="normal" if self._is_video_file(extension) else "disabled"
+        )
+        menu.entryconfigure(
+            "Play Audio", state="normal" if self._is_audio_file(extension) else "disabled"
+        )
+
+    def _get_selected_folder_path(self) -> str | None:
+        selection = self.folder_tree.selection()
+        if not selection:
+            return None
+        values = self.folder_tree.item(selection[0], "values")
+        if not values:
+            return None
+        return values[0]
+
+    def _get_selected_library_item(self) -> tuple[str, str] | None:
+        if not self.current_library:
+            return None
+        tree = self.library_views[self.current_library.library_id]
+        selection = tree.selection()
+        if not selection:
+            return None
+        entry_type, location = tree.item(selection[0], "values")
+        return entry_type, location
+
+    def _play_selected_folder_video(self) -> None:
+        path = self._get_selected_folder_path()
+        if path:
+            self._launch_video_file(path)
+
+    def _play_selected_folder_audio(self) -> None:
+        path = self._get_selected_folder_path()
+        if path:
+            self._play_audio_file(path)
+
+    def _play_selected_library_video(self) -> None:
+        entry = self._get_selected_library_item()
+        if entry:
+            _, path = entry
+            self._launch_video_file(path)
+
+    def _play_selected_library_audio(self) -> None:
+        entry = self._get_selected_library_item()
+        if entry:
+            _, path = entry
+            self._play_audio_file(path)
+
+    def _handle_media_activation(self, path: str) -> None:
+        extension = os.path.splitext(path)[1].lower()
+        if self._is_video_file(extension):
+            self._launch_video_file(path)
+        elif self._is_audio_file(extension):
+            self._play_audio_file(path)
+
     def _open_current_library_location(self) -> None:
         if not self.current_library or self.current_library.library_type != "local":
             messagebox.showinfo(
@@ -1491,6 +1662,188 @@ class MediaServerApp:
             subprocess.run(["open", path], check=False)
         else:
             subprocess.run(["xdg-open", path], check=False)
+
+    def _launch_video_file(self, path: str) -> None:
+        if not os.path.isfile(path):
+            messagebox.showerror("Play Video", "Selected video file is unavailable.")
+            return
+        extension = os.path.splitext(path)[1].lower()
+        if not self._is_video_file(extension):
+            messagebox.showinfo("Play Video", "The selected item is not a video file.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+                return
+            command = ["open", path] if sys.platform == "darwin" else ["xdg-open", path]
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                error_output = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(error_output or "Unable to open video with default player.")
+        except Exception as exc:
+            messagebox.showerror("Play Video", f"Could not launch video player: {exc}")
+
+    def _play_audio_file(self, path: str) -> None:
+        if not os.path.isfile(path):
+            messagebox.showerror("Play Audio", "Selected audio file is unavailable.")
+            return
+        extension = os.path.splitext(path)[1].lower()
+        if not self._is_audio_file(extension):
+            messagebox.showinfo("Play Audio", "The selected item is not an audio file.")
+            return
+        self._stop_audio()
+        self.audio_path = path
+        self.audio_title_var.set(Path(path).name)
+        self.audio_paused_position_ms = 0
+        self.audio_is_paused = False
+        self._start_audio_playback()
+
+    def _start_audio_playback(self) -> None:
+        if not self.audio_path:
+            return
+        self._cancel_audio_progress_job()
+        if self.audio_play_obj:
+            self.audio_play_obj.stop()
+        if self.audio_segment_path != self.audio_path:
+            self.audio_segment = None
+        if not self.audio_segment:
+            try:
+                self.audio_segment = AudioSegment.from_file(self.audio_path)
+                self.audio_segment_path = self.audio_path
+            except Exception as exc:
+                messagebox.showerror("Play Audio", f"Unable to load audio: {exc}")
+                self.audio_segment = None
+                self.audio_segment_path = None
+                self._stop_audio()
+                return
+
+        start_ms = max(0, min(int(self.audio_paused_position_ms), len(self.audio_segment)))
+        segment = self._apply_volume(self.audio_segment[start_ms:])
+        if len(segment) == 0:
+            messagebox.showerror("Play Audio", "Audio file contains no playable data.")
+            return
+
+        try:
+            self.audio_play_obj = simpleaudio.play_buffer(
+                segment.raw_data,
+                num_channels=segment.channels,
+                bytes_per_sample=segment.sample_width,
+                sample_rate=segment.frame_rate,
+            )
+        except Exception as exc:
+            messagebox.showerror("Play Audio", f"Unable to start playback: {exc}")
+            self.audio_play_obj = None
+            self._stop_audio()
+            return
+
+        self.audio_playback_start_time = time.time()
+        self.audio_is_paused = False
+        self._update_audio_time_display()
+        self._schedule_audio_progress()
+        self._toggle_audio_player(True)
+
+    def _resume_or_restart_audio(self) -> None:
+        if not self.audio_path:
+            messagebox.showinfo("Play Audio", "Select an audio file to play.")
+            return
+        if self.audio_is_paused:
+            self._start_audio_playback()
+        else:
+            self.audio_paused_position_ms = 0
+            self._start_audio_playback()
+
+    def _pause_audio(self) -> None:
+        if not self.audio_play_obj:
+            return
+        if self.audio_playback_start_time is None:
+            return
+        if self.audio_play_obj.is_playing():
+            elapsed = int((time.time() - self.audio_playback_start_time) * 1000)
+            self.audio_paused_position_ms = min(
+                self.audio_paused_position_ms + elapsed, self._current_audio_duration()
+            )
+            self.audio_play_obj.stop()
+            self.audio_play_obj = None
+            self.audio_playback_start_time = None
+            self.audio_is_paused = True
+            self._update_audio_time_display()
+
+    def _stop_audio(self) -> None:
+        if self.audio_play_obj:
+            self.audio_play_obj.stop()
+        self.audio_play_obj = None
+        self.audio_playback_start_time = None
+        self.audio_paused_position_ms = 0
+        self.audio_is_paused = False
+        self._cancel_audio_progress_job()
+        self._update_audio_time_display()
+        self.audio_segment = None
+        self.audio_segment_path = None
+        self.audio_path = None
+        self.audio_title_var.set("No audio loaded")
+        self.audio_time_var.set("00:00 / 00:00")
+        self.audio_progress.configure(value=0, maximum=1)
+        self._toggle_audio_player(False)
+
+    def _schedule_audio_progress(self) -> None:
+        self._cancel_audio_progress_job()
+        self.audio_progress_job = self.root.after(250, self._update_audio_progress)
+
+    def _cancel_audio_progress_job(self) -> None:
+        if self.audio_progress_job is not None:
+            self.root.after_cancel(self.audio_progress_job)
+        self.audio_progress_job = None
+
+    def _update_audio_progress(self) -> None:
+        self._update_audio_time_display()
+        playing = self.audio_play_obj is not None and self.audio_play_obj.is_playing()
+        if playing:
+            self._schedule_audio_progress()
+            return
+        if not self.audio_is_paused:
+            self._stop_audio()
+        self.audio_progress_job = None
+
+    def _update_audio_time_display(self) -> None:
+        duration_ms = self._current_audio_duration()
+        elapsed_ms = self._current_audio_position_ms(duration_ms)
+        maximum = duration_ms if duration_ms > 0 else 1
+        self.audio_progress.configure(maximum=maximum, value=min(elapsed_ms, maximum))
+        self.audio_time_var.set(
+            f\"{self._format_milliseconds(elapsed_ms)} / {self._format_milliseconds(duration_ms)}\"
+        )
+
+    def _current_audio_position_ms(self, duration_ms: int) -> int:
+        elapsed_ms = self.audio_paused_position_ms
+        if self.audio_play_obj and self.audio_playback_start_time is not None:
+            elapsed_ms += int((time.time() - self.audio_playback_start_time) * 1000)
+        return min(elapsed_ms, duration_ms)
+
+    def _current_audio_duration(self) -> int:
+        if self.audio_segment:
+            return len(self.audio_segment)
+        return 0
+
+    def _format_milliseconds(self, value: int) -> str:
+        seconds = max(0, int(value // 1000))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f\"{hours:d}:{minutes:02d}:{seconds:02d}\"
+        return f\"{minutes:02d}:{seconds:02d}\"
+
+    def _apply_volume(self, segment: AudioSegment) -> AudioSegment:
+        volume = max(0.0, min(self.audio_volume.get(), 100.0))
+        if volume <= 0:
+            return segment - 120
+        gain_db = 20 * math.log10(volume / 100.0)
+        return segment + gain_db
+
+    def _toggle_audio_player(self, visible: bool) -> None:
+        if visible:
+            self.audio_player_frame.grid()
+        else:
+            self.audio_player_frame.grid_remove()
 
     def _open_theme_dialog(self) -> None:
         ThemeEditorDialog(self.root, self.themes, self._apply_theme)
@@ -1642,10 +1995,24 @@ class MediaServerApp:
         return f"{size:.1f} TB"
 
     @staticmethod
-    def _is_media_file(extension: str) -> bool:
-        audio_exts = {".mp3", ".flac", ".aac", ".m4a", ".wav", ".ogg", ".opus"}
-        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v"}
-        return extension in audio_exts or extension in video_exts
+    def _audio_extensions() -> set[str]:
+        return {".mp3", ".flac", ".aac", ".m4a", ".wav", ".ogg", ".opus"}
+
+    @staticmethod
+    def _video_extensions() -> set[str]:
+        return {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v"}
+
+    @classmethod
+    def _is_audio_file(cls, extension: str) -> bool:
+        return extension in cls._audio_extensions()
+
+    @classmethod
+    def _is_video_file(cls, extension: str) -> bool:
+        return extension in cls._video_extensions()
+
+    @classmethod
+    def _is_media_file(cls, extension: str) -> bool:
+        return cls._is_audio_file(extension) or cls._is_video_file(extension)
 
     def _probe_media(self, path: str) -> list[tuple[str, str]]:
         if not shutil.which("ffprobe"):
