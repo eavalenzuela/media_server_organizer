@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import threading
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1317,17 +1318,33 @@ class WorkflowProcessModal(tk.Toplevel):
 
 
 class SoundDevicePlayObject:
-    def __init__(self, context: object) -> None:
+    def __init__(
+        self,
+        context: object | None,
+        finished_event: threading.Event | None = None,
+        stop_callback: Callable[[], None] | None = None,
+    ) -> None:
         self.context = context
+        self.finished_event = finished_event
+        self.stop_callback = stop_callback
         self._stopped = False
 
     def is_playing(self) -> bool:
         if self._stopped:
             return False
+        if self.finished_event is not None:
+            return not self.finished_event.is_set()
         ctx = self.context
         if ctx is None:
             return False
         status = getattr(ctx, "status", None)
+        if callable(status):
+            try:
+                status_value = status()
+                if hasattr(status_value, "active"):
+                    return bool(status_value.active)
+            except Exception:
+                return False
         if hasattr(status, "active"):
             return bool(status.active)
         active_attr = getattr(ctx, "active", None)
@@ -1348,7 +1365,14 @@ class SoundDevicePlayObject:
         return not self._stopped
 
     def stop(self) -> None:
+        if self._stopped:
+            return
         self._stopped = True
+        if self.stop_callback:
+            try:
+                self.stop_callback()
+            except Exception:
+                return
         ctx = self.context
         stop_method = getattr(ctx, "stop", None)
         if callable(stop_method):
@@ -1362,6 +1386,8 @@ class SoundDevicePlayObject:
                 close_method()
             except Exception:
                 return
+        if self.finished_event is not None:
+            self.finished_event.set()
 
 
 class MediaServerApp:
@@ -2421,8 +2447,17 @@ class MediaServerApp:
             data = data.reshape((-1, segment.channels))
         dtype = self._numpy_dtype(segment.sample_width)
         data = data.astype(dtype, copy=False)
-        context = sd.play(data, samplerate=segment.frame_rate, blocking=False)
-        return SoundDevicePlayObject(context)
+        finished_event = threading.Event()
+
+        def _wait_for_completion() -> None:
+            try:
+                sd.wait()
+            finally:
+                finished_event.set()
+
+        playback = sd.play(data, samplerate=segment.frame_rate, blocking=False)
+        threading.Thread(target=_wait_for_completion, daemon=True).start()
+        return SoundDevicePlayObject(playback, finished_event=finished_event, stop_callback=sd.stop)
 
     @staticmethod
     def _numpy_dtype(sample_width: int) -> str:
