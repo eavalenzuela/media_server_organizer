@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import logging
 import math
 import os
 import shutil
@@ -31,6 +32,38 @@ DEFAULT_THEME = {
     "accent_color": "SystemHighlight",
     "text_color": "SystemWindowText",
 }
+
+
+def configure_logging(level: str | int = "INFO") -> Path:
+    log_level = getattr(logging, str(level).upper(), logging.INFO)
+    logs_dir = Path(__file__).resolve().parent.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_file = logs_dir / "media_server_manager.log"
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
+
+    root_logger.setLevel(log_level)
+    logging.getLogger(__name__).info(
+        "Logging initialized at %s level. Writing to %s",
+        logging.getLevelName(log_level),
+        log_file,
+    )
+    return log_file
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_workflow_runner(workflow_name: str) -> object | None:
@@ -65,6 +98,7 @@ class LibraryDB:
         self.db_path = db_path
         self.connection = sqlite3.connect(self.db_path)
         self._init_schema()
+        logger.debug("LibraryDB initialized with database at %s", self.db_path)
 
     def _init_schema(self) -> None:
         cursor = self.connection.cursor()
@@ -107,7 +141,14 @@ class LibraryDB:
 
     def index_library_items(self, library: Library, max_records: int = 50000) -> None:
         if library.library_type != "local" or not os.path.isdir(library.path):
+            logger.debug(
+                "Skipping indexing for library %s (type=%s, path exists=%s)",
+                library.name,
+                library.library_type,
+                os.path.isdir(library.path),
+            )
             return
+        logger.info("Indexing library items for '%s' at %s", library.name, library.path)
         self.clear_library_items(library.library_id)
         cursor = self.connection.cursor()
         records_inserted = 0
@@ -141,6 +182,12 @@ class LibraryDB:
             if records_inserted >= max_records:
                 break
         self.connection.commit()
+        logger.info(
+            "Indexed %s records for library '%s'%s",
+            records_inserted,
+            library.name,
+            " (truncated)" if records_inserted >= max_records else "",
+        )
 
     def search_items(self, term: str, limit: int = 200) -> list[tuple[int, str, str, str]]:
         cursor = self.connection.cursor()
@@ -155,6 +202,7 @@ class LibraryDB:
             """,
             (like_term, like_term, limit),
         )
+        logger.debug("Search query for term '%s' with limit %s", term, limit)
         return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
 
     def fetch_libraries(self) -> list[Library]:
@@ -1215,6 +1263,7 @@ class MediaServerApp:
         self._build_layout()
         self._apply_theme(self.current_theme)
         self._load_libraries()
+        logger.info("MediaServerApp initialized with %s libraries", len(self.db.fetch_libraries()))
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
@@ -1526,18 +1575,21 @@ class MediaServerApp:
 
         if not os.path.isdir(path):
             tree.insert("", "end", values=("Missing", path))
+            logger.warning("Library path missing for '%s': %s", library.name, path)
             return
 
         try:
             entries = sorted(os.listdir(path))
         except OSError as exc:
             tree.insert("", "end", values=("Error", str(exc)))
+            logger.exception("Unable to list directory for library '%s' at %s", library.name, path)
             return
 
         for entry in entries:
             full_path = os.path.join(path, entry)
             entry_type = "Folder" if os.path.isdir(full_path) else "File"
             tree.insert("", "end", values=(entry_type, full_path))
+        logger.debug("Populated library view for '%s' at %s with %s entries", library.name, path, len(entries))
         self._refresh_search_index(force=False)
 
     def _refresh_search_index(self, force: bool) -> None:
@@ -1549,6 +1601,7 @@ class MediaServerApp:
                 self.indexed_libraries.add(library.library_id)
             except Exception as exc:
                 self.search_status_var.set(f"Indexing failed for {library.name}: {exc}")
+                logger.exception("Indexing failed for library '%s'", library.name)
 
     def _perform_search(self) -> None:
         term = self.search_var.get().strip()
@@ -1557,6 +1610,7 @@ class MediaServerApp:
         if not term:
             self.search_status_var.set("Enter a term to search all libraries.")
             return
+        logger.debug("Starting search for term '%s'", term)
         self.search_status_var.set("Indexing libraries...")
         self.root.update_idletasks()
         self._refresh_search_index(force=False)
@@ -1565,6 +1619,7 @@ class MediaServerApp:
             results = self.db.search_items(term)
         except Exception as exc:
             self.search_status_var.set(f"Search failed: {exc}")
+            logger.exception("Search failed for term '%s'", term)
             return
 
         library_lookup = {lib.library_id: lib for lib in self.db.fetch_libraries()}
@@ -1580,8 +1635,10 @@ class MediaServerApp:
             )
         if results:
             self.search_status_var.set(f"Found {len(results)} matches for '{term}'.")
+            logger.info("Search for '%s' returned %s results", term, len(results))
         else:
             self.search_status_var.set(f"No results for '{term}'.")
+            logger.info("Search for '%s' returned no results", term)
 
     def _open_search_result(self, _event: tk.Event) -> None:
         selection = self.search_results.selection()
@@ -1750,10 +1807,12 @@ class MediaServerApp:
         if not self.current_library or self.current_library.library_type != "local":
             return
         if not os.path.isdir(path):
+            logger.warning("Attempted to navigate to non-directory path: %s", path)
             return
         self.library_paths[self.current_library.library_id] = path
         self._populate_library_view(self.current_library, path)
         self._clear_metadata()
+        logger.debug("Navigated to path %s for library %s", path, self.current_library.name)
 
     def _set_folder_tree_expanded(self, expanded: bool) -> None:
         def recurse(node: str) -> None:
@@ -1865,6 +1924,7 @@ class MediaServerApp:
         if not os.path.isdir(path):
             messagebox.showerror("Open Library Location", "Library path is unavailable.")
             return
+        logger.info("Opening library location: %s", path)
         if sys.platform.startswith("win"):
             os.startfile(path)
         elif sys.platform == "darwin":
@@ -1881,6 +1941,7 @@ class MediaServerApp:
             messagebox.showinfo("Play Video", "The selected item is not a video file.")
             return
         try:
+            logger.info("Launching video file: %s", path)
             if sys.platform.startswith("win"):
                 os.startfile(path)  # type: ignore[attr-defined]
                 return
@@ -1890,6 +1951,7 @@ class MediaServerApp:
                 error_output = result.stderr.strip() or result.stdout.strip()
                 raise RuntimeError(error_output or "Unable to open video with default player.")
         except Exception as exc:
+            logger.exception("Could not launch video player for %s", path)
             messagebox.showerror("Play Video", f"Could not launch video player: {exc}")
 
     def _play_audio_file(self, path: str) -> None:
@@ -1905,6 +1967,7 @@ class MediaServerApp:
         self.audio_title_var.set(Path(path).name)
         self.audio_paused_position_ms = 0
         self.audio_is_paused = False
+        logger.info("Starting audio playback: %s", path)
         self._start_audio_playback()
 
     def _start_audio_playback(self) -> None:
@@ -1920,6 +1983,7 @@ class MediaServerApp:
                 self.audio_segment = AudioSegment.from_file(self.audio_path)
                 self.audio_segment_path = self.audio_path
             except Exception as exc:
+                logger.exception("Unable to load audio: %s", self.audio_path)
                 messagebox.showerror("Play Audio", f"Unable to load audio: {exc}")
                 self.audio_segment = None
                 self.audio_segment_path = None
@@ -1940,6 +2004,7 @@ class MediaServerApp:
                 sample_rate=segment.frame_rate,
             )
         except Exception as exc:
+            logger.exception("Unable to start playback for %s", self.audio_path)
             messagebox.showerror("Play Audio", f"Unable to start playback: {exc}")
             self.audio_play_obj = None
             self._stop_audio()
@@ -1952,6 +2017,7 @@ class MediaServerApp:
         self._toggle_audio_player(True)
 
     def _handle_playback_exception(self, exc: Exception) -> None:
+        logger.exception("Playback error")
         messagebox.showerror("Play Audio", f"Playback error: {exc}")
         self._stop_audio(suppress_errors=True)
 
@@ -1998,6 +2064,7 @@ class MediaServerApp:
             self.audio_playback_start_time = None
             self.audio_is_paused = True
             self._update_audio_time_display()
+            logger.debug("Paused audio at %sms", self.audio_paused_position_ms)
 
     def _stop_audio(self, suppress_errors: bool = False) -> None:
         if self.audio_play_obj:
@@ -2019,6 +2086,7 @@ class MediaServerApp:
         self.audio_time_var.set("00:00 / 00:00")
         self.audio_progress.configure(value=0, maximum=1)
         self._toggle_audio_player(False)
+        logger.info("Audio playback stopped")
 
     def _schedule_audio_progress(self) -> None:
         self._cancel_audio_progress_job()
@@ -2416,10 +2484,20 @@ def run() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default=DB_DEFAULT_PATH, help="SQLite database location.")
     parser.add_argument("--nogui", action="store_true", help="Run in CLI-only mode.")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
+    )
     args = parser.parse_args()
+
+    log_file = configure_logging(args.log_level)
+    logger.info("Using database at %s", args.db)
+    logger.info("Log file: %s", log_file)
 
     if args.nogui:
         print("GUI disabled. Provide --db to change database location.")
+        logger.info("Running in CLI-only mode; GUI disabled")
         return
 
     root = tk.Tk()
