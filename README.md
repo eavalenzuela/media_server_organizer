@@ -1,6 +1,6 @@
 # Media Server Organizer
 
-Media Server Organizer is a desktop GUI for organizing the files and folders of a media server (music, videos, books, comics). It keeps common chores in one place while staying predictable and conservative about what it changes.
+Media Server Organizer is a desktop application for organizing media files across libraries. It uses a workflow-driven approach to mass-change operations, that includes automatically generating rollback scripts to undo any changes made, even during 'destructive' operations like de-duplication.
 
 ![Main application window](mso_window.png)
 
