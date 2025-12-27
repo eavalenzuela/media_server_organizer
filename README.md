@@ -30,4 +30,5 @@ python src/media_server_manager.py
 ```bash
 python src/media_server_manager.py --db /path/to/media.db
 python src/media_server_manager.py --nogui
+python src/media_server_manager.py --audio-backend sounddevice
 ```

@@ -1316,8 +1316,56 @@ class WorkflowProcessModal(tk.Toplevel):
             self.list_view.insert("", "end", values=(name, value))
 
 
+class SoundDevicePlayObject:
+    def __init__(self, context: object) -> None:
+        self.context = context
+        self._stopped = False
+
+    def is_playing(self) -> bool:
+        if self._stopped:
+            return False
+        ctx = self.context
+        if ctx is None:
+            return False
+        status = getattr(ctx, "status", None)
+        if hasattr(status, "active"):
+            return bool(status.active)
+        active_attr = getattr(ctx, "active", None)
+        if isinstance(active_attr, bool):
+            return active_attr
+        is_active = getattr(ctx, "is_active", None)
+        if callable(is_active):
+            try:
+                return bool(is_active())
+            except Exception:
+                return False
+        finished = getattr(ctx, "finished", None)
+        if hasattr(finished, "is_set"):
+            try:
+                return not finished.is_set()
+            except Exception:
+                return False
+        return not self._stopped
+
+    def stop(self) -> None:
+        self._stopped = True
+        ctx = self.context
+        stop_method = getattr(ctx, "stop", None)
+        if callable(stop_method):
+            try:
+                stop_method()
+            except Exception:
+                return
+        close_method = getattr(ctx, "close", None)
+        if callable(close_method):
+            try:
+                close_method()
+            except Exception:
+                return
+
+
 class MediaServerApp:
-    def __init__(self, root: tk.Tk, db: LibraryDB) -> None:
+    def __init__(self, root: tk.Tk, db: LibraryDB, audio_backend: str = "simpleaudio") -> None:
         self.root = root
         self.db = db
         self.root.title("Media Server Organizer")
@@ -1340,7 +1388,8 @@ class MediaServerApp:
         self.current_library: Library | None = None
         self.audio_segment: AudioSegment | None = None
         self.audio_segment_path: str | None = None
-        self.audio_play_obj: simpleaudio.PlayObject | None = None
+        self.audio_play_obj: simpleaudio.PlayObject | SoundDevicePlayObject | None = None
+        self.audio_backend = audio_backend if audio_backend in {"simpleaudio", "sounddevice"} else "simpleaudio"
         self.audio_path: str | None = None
         self.audio_paused_position_ms = 0
         self.audio_playback_start_time: float | None = None
@@ -2320,12 +2369,7 @@ class MediaServerApp:
             return
 
         try:
-            self.audio_play_obj = simpleaudio.play_buffer(
-                segment.raw_data,
-                num_channels=segment.channels,
-                bytes_per_sample=segment.sample_width,
-                sample_rate=segment.frame_rate,
-            )
+            self.audio_play_obj = self._play_segment(segment)
         except Exception as exc:
             logger.exception("Unable to start playback for %s", self.audio_path)
             messagebox.showerror("Play Audio", f"Unable to start playback: {exc}")
@@ -2338,6 +2382,61 @@ class MediaServerApp:
         self._update_audio_time_display()
         self._schedule_audio_progress()
         self._toggle_audio_player(True)
+
+    def _play_segment(self, segment: AudioSegment) -> object:
+        backend = getattr(self, "audio_backend", "simpleaudio")
+        if backend == "sounddevice":
+            return self._play_with_sounddevice(segment)
+        return self._play_with_simpleaudio(segment)
+
+    def _play_with_simpleaudio(self, segment: AudioSegment) -> simpleaudio.PlayObject:
+        return simpleaudio.play_buffer(
+            segment.raw_data,
+            num_channels=segment.channels,
+            bytes_per_sample=segment.sample_width,
+            sample_rate=segment.frame_rate,
+        )
+
+    def _play_with_sounddevice(self, segment: AudioSegment) -> SoundDevicePlayObject:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError(
+                "The sounddevice backend requires numpy. Install it or use the simpleaudio backend."
+            ) from exc
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise RuntimeError(
+                "sounddevice is not installed. Install it or use the simpleaudio backend."
+            ) from exc
+
+        if hasattr(segment, "get_array_of_samples"):
+            sample_data = segment.get_array_of_samples()  # type: ignore[attr-defined]
+        else:
+            dtype = self._numpy_dtype(segment.sample_width)
+            sample_data = np.frombuffer(segment.raw_data, dtype=dtype)
+        data = np.array(sample_data)
+        if segment.channels > 1:
+            data = data.reshape((-1, segment.channels))
+        dtype = self._numpy_dtype(segment.sample_width)
+        data = data.astype(dtype, copy=False)
+        context = sd.play(data, samplerate=segment.frame_rate, blocking=False)
+        return SoundDevicePlayObject(context)
+
+    @staticmethod
+    def _numpy_dtype(sample_width: int) -> str:
+        match sample_width:
+            case 1:
+                return "int8"
+            case 2:
+                return "int16"
+            case 3:
+                return "int32"
+            case 4:
+                return "int32"
+            case _:
+                raise RuntimeError(f"Unsupported sample width: {sample_width}")
 
     def _handle_playback_exception(self, exc: Exception) -> None:
         logger.exception("Playback error")
@@ -2812,11 +2911,18 @@ def run() -> None:
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
     )
+    parser.add_argument(
+        "--audio-backend",
+        choices=["simpleaudio", "sounddevice"],
+        default="simpleaudio",
+        help="Choose the playback backend for audio files.",
+    )
     args = parser.parse_args()
 
     log_file = configure_logging(args.log_level)
     logger.info("Using database at %s", args.db)
     logger.info("Log file: %s", log_file)
+    logger.info("Audio backend: %s", args.audio_backend)
 
     if args.nogui:
         print("GUI disabled. Provide --db to change database location.")
@@ -2826,7 +2932,7 @@ def run() -> None:
     root = tk.Tk()
     db = LibraryDB(args.db)
     try:
-        MediaServerApp(root, db)
+        MediaServerApp(root, db, audio_backend=args.audio_backend)
         root.mainloop()
     finally:
         db.close()
