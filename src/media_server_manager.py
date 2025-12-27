@@ -95,6 +95,19 @@ class Library:
     username: str | None
 
 
+@dataclass(frozen=True)
+class AudioSignature:
+    id: int
+    library_id: int | None
+    path: str
+    signature: str
+    bitrate: int | None
+    sample_rate: int | None
+    format: str | None
+    kept: bool
+    updated_at: str | None
+
+
 class LibraryDB:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -134,7 +147,165 @@ class LibraryDB:
             ON library_items(library_id, name, path)
             """
         )
+        self._ensure_audio_signatures_schema(cursor)
         self.connection.commit()
+
+    def _ensure_audio_signatures_schema(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audio_signatures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id INTEGER,
+                path TEXT UNIQUE,
+                signature TEXT NOT NULL,
+                bitrate INTEGER,
+                sample_rate INTEGER,
+                format TEXT,
+                kept INTEGER DEFAULT 1,
+                updated_at TEXT,
+                FOREIGN KEY(library_id) REFERENCES libraries(id)
+            )
+            """
+        )
+        existing_columns = {
+            row[1]: row for row in cursor.execute("PRAGMA table_info(audio_signatures)")
+        }
+        if "kept" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN kept INTEGER DEFAULT 1")
+        if "updated_at" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN updated_at TEXT")
+        if "bitrate" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN bitrate INTEGER")
+        if "sample_rate" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN sample_rate INTEGER")
+        if "format" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN format TEXT")
+        if "signature" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN signature TEXT")
+        if "library_id" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN library_id INTEGER")
+        if "path" not in existing_columns:
+            cursor.execute("ALTER TABLE audio_signatures ADD COLUMN path TEXT")
+        try:
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_signatures_path
+                ON audio_signatures(path)
+                """
+            )
+        except sqlite3.OperationalError:
+            logger.warning("Unable to enforce unique index on audio_signatures.path; proceeding without it")
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audio_signatures_signature
+            ON audio_signatures(signature)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audio_signatures_library_signature
+            ON audio_signatures(library_id, signature)
+            """
+        )
+
+    def _row_to_audio_signature(self, row: tuple) -> AudioSignature:
+        return AudioSignature(
+            id=row[0],
+            library_id=row[1],
+            path=row[2],
+            signature=row[3],
+            bitrate=row[4],
+            sample_rate=row[5],
+            format=row[6],
+            kept=bool(row[7]),
+            updated_at=row[8],
+        )
+
+    def upsert_audio_signature(
+        self,
+        path: str,
+        signature: str,
+        library_id: int | None = None,
+        bitrate: int | None = None,
+        sample_rate: int | None = None,
+        format_name: str | None = None,
+        kept: bool = True,
+    ) -> AudioSignature:
+        updated_at = datetime.utcnow().isoformat(timespec="seconds")
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO audio_signatures (library_id, path, signature, bitrate, sample_rate, format, kept, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                library_id = excluded.library_id,
+                signature = excluded.signature,
+                bitrate = excluded.bitrate,
+                sample_rate = excluded.sample_rate,
+                format = excluded.format,
+                kept = excluded.kept,
+                updated_at = excluded.updated_at
+            """,
+            (
+                library_id,
+                path,
+                signature,
+                bitrate,
+                sample_rate,
+                format_name,
+                1 if kept else 0,
+                updated_at,
+            ),
+        )
+        self.connection.commit()
+        signature_row = cursor.execute(
+            """
+            SELECT id, library_id, path, signature, bitrate, sample_rate, format, kept, updated_at
+            FROM audio_signatures
+            WHERE path = ?
+            """,
+            (path,),
+        ).fetchone()
+        if not signature_row:
+            raise RuntimeError("Failed to upsert audio signature.")
+        return self._row_to_audio_signature(signature_row)
+
+    def fetch_audio_signature_by_path(self, path: str) -> AudioSignature | None:
+        cursor = self.connection.cursor()
+        row = cursor.execute(
+            """
+            SELECT id, library_id, path, signature, bitrate, sample_rate, format, kept, updated_at
+            FROM audio_signatures
+            WHERE path = ?
+            """,
+            (path,),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_to_audio_signature(row)
+
+    def fetch_duplicates_by_signature(
+        self, signature: str, library_id: int | None = None
+    ) -> list[AudioSignature]:
+        cursor = self.connection.cursor()
+        params: list[object] = [signature]
+        query = """
+            SELECT id, library_id, path, signature, bitrate, sample_rate, format, kept, updated_at
+            FROM audio_signatures
+            WHERE signature = ?
+        """
+        if library_id is not None:
+            query += " AND library_id = ?"
+            params.append(library_id)
+        query += " ORDER BY kept DESC, bitrate DESC, sample_rate DESC"
+        return [self._row_to_audio_signature(row) for row in cursor.execute(query, params).fetchall()]
+
+    def find_library_by_path(self, path: str) -> Library | None:
+        target_path = os.path.abspath(path)
+        for library in self.fetch_libraries():
+            if os.path.abspath(library.path) == target_path:
+                return library
+        return None
 
     def clear_library_items(self, library_id: int) -> None:
         cursor = self.connection.cursor()
@@ -2448,16 +2619,22 @@ class MediaServerApp:
         dtype = self._numpy_dtype(segment.sample_width)
         data = data.astype(dtype, copy=False)
         finished_event = threading.Event()
+        wait_fn = getattr(sd, "wait", None)
+        stop_fn = getattr(sd, "stop", None)
 
         def _wait_for_completion() -> None:
             try:
-                sd.wait()
+                if callable(wait_fn):
+                    wait_fn()
             finally:
                 finished_event.set()
 
         playback = sd.play(data, samplerate=segment.frame_rate, blocking=False)
-        threading.Thread(target=_wait_for_completion, daemon=True).start()
-        return SoundDevicePlayObject(playback, finished_event=finished_event, stop_callback=sd.stop)
+        if callable(wait_fn):
+            threading.Thread(target=_wait_for_completion, daemon=True).start()
+        return SoundDevicePlayObject(
+            playback, finished_event=finished_event, stop_callback=stop_fn if callable(stop_fn) else None
+        )
 
     @staticmethod
     def _numpy_dtype(sample_width: int) -> str:
