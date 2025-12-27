@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -282,6 +283,98 @@ class LibraryDB:
 
     def close(self) -> None:
         self.connection.close()
+
+
+class PlaylistManager:
+    def __init__(self, playlist_dir: Path) -> None:
+        self.playlist_dir = playlist_dir
+        self.playlist_dir.mkdir(parents=True, exist_ok=True)
+        self.playlists: dict[str, list[str]] = {}
+        self.load_playlists()
+
+    def load_playlists(self) -> None:
+        self.playlists.clear()
+        for playlist_file in sorted(self.playlist_dir.glob("*.m3u")):
+            name = playlist_file.stem
+            try:
+                lines = playlist_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            entries = [
+                line.strip()
+                for line in lines
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            self.playlists[name] = entries
+
+    def _playlist_path(self, name: str) -> Path:
+        safe_name = re.sub(r"[^\w\-\s\.]", "_", name).strip() or "playlist"
+        return self.playlist_dir / f"{safe_name}.m3u"
+
+    def create_playlist(self, name: str) -> str:
+        name = name.strip()
+        if not name:
+            raise ValueError("Playlist name cannot be empty.")
+        if name in self.playlists:
+            return name
+        self.playlists[name] = []
+        self._save_playlist(name)
+        return name
+
+    def add_item(self, name: str, path: str) -> None:
+        if name not in self.playlists:
+            self.create_playlist(name)
+        normalized_path = os.path.abspath(path)
+        if normalized_path not in self.playlists[name]:
+            self.playlists[name].append(normalized_path)
+            self._save_playlist(name)
+
+    def remove_item(self, name: str, path: str) -> None:
+        if name not in self.playlists:
+            return
+        normalized_path = os.path.abspath(path)
+        try:
+            self.playlists[name].remove(normalized_path)
+        except ValueError:
+            return
+        self._save_playlist(name)
+
+    def delete_playlist(self, name: str) -> None:
+        self.playlists.pop(name, None)
+        playlist_path = self._playlist_path(name)
+        if playlist_path.exists():
+            try:
+                playlist_path.unlink()
+            except OSError:
+                pass
+
+    def _save_playlist(self, name: str) -> None:
+        playlist_path = self._playlist_path(name)
+        playlist_path.parent.mkdir(parents=True, exist_ok=True)
+        entries = self.playlists.get(name, [])
+        content_lines = ["#EXTM3U", *entries]
+        playlist_path.write_text("\n".join(content_lines) + "\n", encoding="utf-8")
+
+    def rename_playlist(self, old_name: str, new_name: str) -> str:
+        if old_name not in self.playlists:
+            raise ValueError("Playlist does not exist.")
+        new_name = new_name.strip()
+        if not new_name:
+            raise ValueError("Playlist name cannot be empty.")
+        if new_name == old_name:
+            return old_name
+        if new_name in self.playlists:
+            raise ValueError("A playlist with that name already exists.")
+        entries = self.playlists.pop(old_name)
+        old_path = self._playlist_path(old_name)
+        self.playlists[new_name] = entries
+        if old_path.exists():
+            try:
+                old_path.unlink()
+            except OSError:
+                pass
+        self._save_playlist(new_name)
+        return new_name
 
 
 class NewLibraryDialog(tk.Toplevel):
@@ -1233,6 +1326,14 @@ class MediaServerApp:
         self.themes = self._load_themes()
         self.current_theme = dict(self.themes.get("Default", DEFAULT_THEME))
 
+        self.playlist_dir = Path(__file__).resolve().parent.parent / "playlists"
+        self.playlist_manager = PlaylistManager(self.playlist_dir)
+        self.playlists_visible = True
+        self.current_playlist_name = tk.StringVar(value="")
+        self.playlist_items: ttk.Treeview | None = None
+        self.playlist_listbox: tk.Listbox | None = None
+        self.playlist_toggle_button: ttk.Button | None = None
+
         self.library_tabs: dict[int, ttk.Frame] = {}
         self.library_views: dict[int, ttk.Treeview] = {}
         self.library_paths: dict[int, str] = {}
@@ -1258,11 +1359,18 @@ class MediaServerApp:
         self.library_context_menu.add_command(
             label="Play Audio", command=self._play_selected_library_audio
         )
+        self.library_context_menu.add_separator()
+        self.library_context_menu.add_command(label="New Playlist...", command=self._prompt_new_playlist)
+        self.library_playlist_submenu = tk.Menu(self.library_context_menu, tearoff=0)
+        self.library_context_menu.add_cascade(
+            label="Add to Playlist", menu=self.library_playlist_submenu
+        )
 
         self._build_menu()
         self._build_layout()
         self._apply_theme(self.current_theme)
         self._load_libraries()
+        self._update_playlist_menus()
         logger.info("MediaServerApp initialized with %s libraries", len(self.db.fetch_libraries()))
 
     def _build_menu(self) -> None:
@@ -1344,6 +1452,12 @@ class MediaServerApp:
         self.folder_tree_menu.add_command(
             label="Play Audio", command=self._play_selected_folder_audio
         )
+        self.folder_tree_menu.add_separator()
+        self.folder_tree_menu.add_command(label="New Playlist...", command=self._prompt_new_playlist)
+        self.folder_playlist_submenu = tk.Menu(self.folder_tree_menu, tearoff=0)
+        self.folder_tree_menu.add_cascade(
+            label="Add to Playlist", menu=self.folder_playlist_submenu
+        )
 
         self.metadata_frame = ttk.Labelframe(
             self.left_frame, text="File Metadata", padding=8, style="Metadata.TLabelframe"
@@ -1372,7 +1486,9 @@ class MediaServerApp:
             "<Configure>", lambda event: self.metadata_canvas.itemconfig(self.metadata_window, width=event.width)
         )
 
-        self.right_frame = ttk.Frame(main_pane)
+        self.content_pane = ttk.PanedWindow(main_pane, orient="horizontal")
+
+        self.right_frame = ttk.Frame(self.content_pane)
         self.right_frame.columnconfigure(0, weight=1)
         self.right_frame.rowconfigure(1, weight=2)
         self.right_frame.rowconfigure(2, weight=1)
@@ -1390,8 +1506,15 @@ class MediaServerApp:
         self._build_search_results()
         self._build_audio_player()
 
+        self.playlist_frame = ttk.Frame(self.content_pane, width=300, padding=(8, 6))
+        self.playlist_frame.columnconfigure(0, weight=1)
+        self.playlist_frame.rowconfigure(1, weight=1)
+        self._build_playlist_pane()
+
         main_pane.add(self.left_frame, weight=1)
-        main_pane.add(self.right_frame, weight=4)
+        main_pane.add(self.content_pane, weight=4)
+        self.content_pane.add(self.right_frame, weight=3)
+        self.content_pane.add(self.playlist_frame, weight=1)
 
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self.right_frame, padding=(8, 6))
@@ -1405,9 +1528,12 @@ class MediaServerApp:
         ttk.Button(toolbar, text="Go", command=self._perform_search).grid(
             row=0, column=2, padx=(6, 0)
         )
+        ttk.Button(toolbar, text="Playlists Pane", command=self._toggle_playlist_pane).grid(
+            row=0, column=3, padx=(6, 0)
+        )
 
         self.search_status = ttk.Label(toolbar, textvariable=self.search_status_var, anchor="w")
-        self.search_status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.search_status.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
 
     def _build_search_results(self) -> None:
         frame = ttk.Labelframe(self.right_frame, text="Search Results", padding=6)
@@ -1475,6 +1601,184 @@ class MediaServerApp:
         ).pack(side="left", padx=(6, 0), fill="x", expand=True)
         ttk.Label(volume_frame, text="%", style="Metadata.TLabel").pack(side="left", padx=(4, 0))
         self._toggle_audio_player(False)
+
+    def _build_playlist_pane(self) -> None:
+        header = ttk.Frame(self.playlist_frame)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Playlists", style="Metadata.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="New", command=self._prompt_new_playlist).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+        self.playlist_toggle_button = ttk.Button(header, text="Hide", command=self._toggle_playlist_pane)
+        self.playlist_toggle_button.grid(
+            row=0, column=2, padx=(6, 0)
+        )
+
+        list_container = ttk.Labelframe(self.playlist_frame, text="Available Playlists", padding=6)
+        list_container.grid(row=1, column=0, sticky="nsew")
+        list_container.columnconfigure(0, weight=1)
+        list_container.rowconfigure(0, weight=1)
+        self.playlist_listbox = tk.Listbox(list_container, exportselection=False, height=6)
+        playlist_scroll = ttk.Scrollbar(
+            list_container, orient="vertical", command=self.playlist_listbox.yview
+        )
+        self.playlist_listbox.configure(yscrollcommand=playlist_scroll.set)
+        self.playlist_listbox.grid(row=0, column=0, sticky="nsew")
+        playlist_scroll.grid(row=0, column=1, sticky="ns")
+        self.playlist_listbox.bind("<<ListboxSelect>>", self._on_playlist_selected)
+
+        items_container = ttk.Labelframe(self.playlist_frame, text="Playlist Items", padding=6)
+        items_container.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        items_container.columnconfigure(0, weight=1)
+        items_container.rowconfigure(0, weight=1)
+        self.playlist_items = ttk.Treeview(
+            items_container,
+            columns=("name", "path"),
+            show="headings",
+            height=8,
+        )
+        self.playlist_items.heading("name", text="Name")
+        self.playlist_items.heading("path", text="Path")
+        self.playlist_items.column("name", width=120, anchor="w")
+        self.playlist_items.column("path", width=260, anchor="w")
+        self.playlist_items.grid(row=0, column=0, sticky="nsew")
+        item_scroll = ttk.Scrollbar(items_container, orient="vertical", command=self.playlist_items.yview)
+        item_scroll.grid(row=0, column=1, sticky="ns")
+        self.playlist_items.configure(yscrollcommand=item_scroll.set)
+        self.playlist_items.bind("<Double-1>", self._open_playlist_item)
+
+        item_controls = ttk.Frame(items_container)
+        item_controls.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        ttk.Button(item_controls, text="Remove Selected", command=self._remove_selected_playlist_item).pack(
+            side="right"
+        )
+
+        self.playlist_frame.rowconfigure(2, weight=1)
+        self._refresh_playlist_list()
+
+    def _toggle_playlist_pane(self) -> None:
+        if self.playlists_visible:
+            self.content_pane.forget(self.playlist_frame)
+            self.playlists_visible = False
+            if self.playlist_toggle_button:
+                self.playlist_toggle_button.configure(text="Show")
+        else:
+            self.content_pane.add(self.playlist_frame, weight=1)
+            self.playlists_visible = True
+            if self.playlist_toggle_button:
+                self.playlist_toggle_button.configure(text="Hide")
+
+    def _prompt_new_playlist(self) -> None:
+        name = simpledialog.askstring("New Playlist", "Playlist name:", parent=self.root)
+        if not name:
+            return
+        try:
+            created = self.playlist_manager.create_playlist(name)
+        except ValueError as exc:
+            messagebox.showerror("New Playlist", str(exc))
+            return
+        self.current_playlist_name.set(created)
+        self._refresh_playlist_list()
+        self._refresh_playlist_items()
+        self._update_playlist_menus()
+
+    def _refresh_playlist_list(self) -> None:
+        if not self.playlist_listbox:
+            return
+        self.playlist_listbox.delete(0, tk.END)
+        current = self.current_playlist_name.get()
+        for name in sorted(self.playlist_manager.playlists):
+            self.playlist_listbox.insert(tk.END, name)
+        if current and current in self.playlist_manager.playlists:
+            index = sorted(self.playlist_manager.playlists).index(current)
+            self.playlist_listbox.selection_set(index)
+        elif self.playlist_manager.playlists:
+            self.playlist_listbox.selection_set(0)
+            self.current_playlist_name.set(sorted(self.playlist_manager.playlists)[0])
+        else:
+            self.current_playlist_name.set("")
+        self._refresh_playlist_items()
+
+    def _on_playlist_selected(self, _event: tk.Event) -> None:
+        if not self.playlist_listbox:
+            return
+        selection = self.playlist_listbox.curselection()
+        if not selection:
+            self.current_playlist_name.set("")
+            self._refresh_playlist_items()
+            return
+        index = selection[0]
+        names = sorted(self.playlist_manager.playlists)
+        if 0 <= index < len(names):
+            self.current_playlist_name.set(names[index])
+        self._refresh_playlist_items()
+
+    def _refresh_playlist_items(self) -> None:
+        if not self.playlist_items:
+            return
+        for item in self.playlist_items.get_children():
+            self.playlist_items.delete(item)
+        playlist_name = self.current_playlist_name.get()
+        entries = self.playlist_manager.playlists.get(playlist_name, [])
+        for path in entries:
+            self.playlist_items.insert("", "end", values=(Path(path).name, path))
+
+    def _open_playlist_item(self, _event: tk.Event) -> None:
+        selection = self.playlist_items.selection() if self.playlist_items else ()
+        if not selection:
+            return
+        values = self.playlist_items.item(selection[0], "values")
+        if len(values) < 2:
+            return
+        path = values[1]
+        self._handle_media_activation(path)
+
+    def _remove_selected_playlist_item(self) -> None:
+        if not self.playlist_items:
+            return
+        selection = self.playlist_items.selection()
+        if not selection:
+            return
+        playlist_name = self.current_playlist_name.get()
+        if not playlist_name:
+            return
+        removed_any = False
+        for item_id in selection:
+            values = self.playlist_items.item(item_id, "values")
+            if len(values) < 2:
+                continue
+            path = values[1]
+            self.playlist_manager.remove_item(playlist_name, path)
+            removed_any = True
+        if removed_any:
+            self._refresh_playlist_items()
+            self._update_playlist_menus()
+
+    def _add_path_to_playlist(self, playlist_name: str, path: str) -> None:
+        if not os.path.isfile(path):
+            messagebox.showerror("Add to Playlist", "Selected file is unavailable.")
+            return
+        extension = os.path.splitext(path)[1].lower()
+        if not self._is_media_file(extension):
+            messagebox.showinfo("Add to Playlist", "Only audio or video files can be added.")
+            return
+        try:
+            self.playlist_manager.add_item(playlist_name, path)
+        except ValueError as exc:
+            messagebox.showerror("Add to Playlist", str(exc))
+            return
+        if self.current_playlist_name.get() == playlist_name:
+            self._refresh_playlist_items()
+        self._update_playlist_menus()
+
+    def _update_playlist_menus(self) -> None:
+        self._rebuild_add_to_playlist_menu(
+            self.folder_playlist_submenu, self._get_selected_folder_path()
+        )
+        entry = self._get_selected_library_item()
+        path = entry[1] if entry else None
+        self._rebuild_add_to_playlist_menu(self.library_playlist_submenu, path)
 
     def _load_libraries(self) -> None:
         for library in self.db.fetch_libraries():
@@ -1851,11 +2155,13 @@ class MediaServerApp:
     def _update_folder_menu_state(self) -> None:
         path = self._get_selected_folder_path()
         self._set_menu_state(self.folder_tree_menu, path)
+        self._rebuild_add_to_playlist_menu(self.folder_playlist_submenu, path)
 
     def _update_library_menu_state(self) -> None:
         entry = self._get_selected_library_item()
         path = entry[1] if entry else None
         self._set_menu_state(self.library_context_menu, path)
+        self._rebuild_add_to_playlist_menu(self.library_playlist_submenu, path)
 
     def _set_menu_state(self, menu: tk.Menu, path: str | None) -> None:
         extension = os.path.splitext(path)[1].lower() if path else ""
@@ -1865,6 +2171,23 @@ class MediaServerApp:
         menu.entryconfigure(
             "Play Audio", state="normal" if self._is_audio_file(extension) else "disabled"
         )
+
+    def _rebuild_add_to_playlist_menu(self, submenu: tk.Menu, path: str | None) -> None:
+        submenu.delete(0, "end")
+        submenu.add_command(label="New Playlist...", command=self._prompt_new_playlist)
+        submenu.add_separator()
+        if not path or not os.path.isfile(path):
+            submenu.add_command(label="Select a media file to add", state="disabled")
+            return
+        extension = os.path.splitext(path)[1].lower()
+        if not self._is_media_file(extension):
+            submenu.add_command(label="Only audio or video files can be added", state="disabled")
+            return
+        if not self.playlist_manager.playlists:
+            submenu.add_command(label="No playlists yet", state="disabled")
+            return
+        for name in sorted(self.playlist_manager.playlists):
+            submenu.add_command(label=name, command=lambda n=name, p=path: self._add_path_to_playlist(n, p))
 
     def _get_selected_folder_path(self) -> str | None:
         selection = self.folder_tree.selection()
