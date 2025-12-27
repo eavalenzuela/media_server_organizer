@@ -1,3 +1,5 @@
 paramiko
 pydub
 simpleaudio
+sounddevice
+numpy

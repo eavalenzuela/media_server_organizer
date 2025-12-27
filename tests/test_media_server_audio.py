@@ -1,4 +1,5 @@
 import math
+import sys
 import time
 import types
 from pathlib import Path
@@ -82,6 +83,7 @@ def app(db):
     app.audio_segment = None
     app.audio_segment_path = None
     app.audio_play_obj = None
+    app.audio_backend = "simpleaudio"
     app.audio_path = None
     app.audio_paused_position_ms = 0
     app.audio_playback_start_time = None
@@ -211,6 +213,58 @@ def test_start_audio_playback_loads_and_schedules(app, audio_loader, play_buffer
     assert play_buffer_stub[-1]["obj"].is_playing() is True
     assert after_calls, "root.after should be invoked to schedule progress updates"
     assert app.audio_progress_job == f"job-{len(after_calls)}"
+
+
+def test_sounddevice_backend_is_used_when_selected(app, monkeypatch):
+    play_calls: list[dict[str, object]] = []
+
+    class DummyContext:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        @property
+        def active(self) -> bool:
+            return not self.stopped
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class DummyArray(list):
+        def reshape(self, _shape):
+            return self
+
+        def astype(self, _dtype, copy=False):
+            return self
+
+    class DummyNumpy(types.SimpleNamespace):
+        def array(self, data):
+            return DummyArray(data)
+
+        def frombuffer(self, data, dtype=None):
+            return DummyArray(data)
+
+    def fake_play(data, samplerate, blocking=False):
+        play_calls.append({"data": data, "samplerate": samplerate, "blocking": blocking})
+        return DummyContext()
+
+    monkeypatch.setitem(sys.modules, "numpy", DummyNumpy())
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(play=fake_play))
+    monkeypatch.setattr(app.root, "after", lambda *args, **kwargs: "job-1")
+    monkeypatch.setattr(app.root, "after_cancel", lambda *args, **kwargs: None)
+
+    segment = AudioSegment.silent(duration=1000)
+    app.audio_segment = segment
+    app.audio_segment_path = "song.wav"
+    app.audio_path = "song.wav"
+    app.audio_backend = "sounddevice"
+
+    app._start_audio_playback()
+
+    assert play_calls
+    assert play_calls[-1]["samplerate"] == segment.frame_rate
+    assert play_calls[-1]["blocking"] is False
+    assert app.audio_play_obj is not None
+    assert app.audio_play_obj.is_playing() is True
 
 
 def test_pause_audio_preserves_position(app, monkeypatch):
