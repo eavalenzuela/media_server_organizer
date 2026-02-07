@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 import importlib.util
 import json
 import logging
@@ -221,6 +222,26 @@ class LibraryDB:
             updated_at=row[8],
         )
 
+    def begin_transaction(self) -> None:
+        self.connection.execute("BEGIN")
+
+    def commit_transaction(self) -> None:
+        self.connection.commit()
+
+    def rollback_transaction(self) -> None:
+        self.connection.rollback()
+
+    @contextmanager
+    def transaction(self):
+        self.begin_transaction()
+        try:
+            yield
+        except Exception:
+            self.rollback_transaction()
+            raise
+        else:
+            self.commit_transaction()
+
     def upsert_audio_signature(
         self,
         path: str,
@@ -230,6 +251,7 @@ class LibraryDB:
         sample_rate: int | None = None,
         format_name: str | None = None,
         kept: bool = True,
+        auto_commit: bool = True,
     ) -> AudioSignature:
         updated_at = datetime.utcnow().isoformat(timespec="seconds")
         cursor = self.connection.cursor()
@@ -257,7 +279,8 @@ class LibraryDB:
                 updated_at,
             ),
         )
-        self.connection.commit()
+        if auto_commit:
+            self.connection.commit()
         signature_row = cursor.execute(
             """
             SELECT id, library_id, path, signature, bitrate, sample_rate, format, kept, updated_at

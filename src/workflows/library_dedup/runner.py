@@ -125,21 +125,27 @@ class LibraryDedupWorkflow:
         recorded_count = 0
 
         try:
-            for group in plan.duplicates:
-                best = group.best
-                for candidate in group.candidates:
-                    kept = candidate.path == best.path
-                    db.upsert_audio_signature(
-                        path=str(candidate.path),
-                        signature=candidate.signature,
-                        library_id=library.library_id if library else None,
-                        bitrate=candidate.bitrate,
-                        sample_rate=candidate.sample_rate,
-                        format_name=candidate.format_name,
-                        kept=kept,
-                    )
-                    recorded_count += 1
-                kept_count += 1
+            with db.transaction():
+                for group in plan.duplicates:
+                    best = group.best
+                    for candidate in group.candidates:
+                        kept = candidate.path == best.path
+                        db.upsert_audio_signature(
+                            path=str(candidate.path),
+                            signature=candidate.signature,
+                            library_id=library.library_id if library else None,
+                            bitrate=candidate.bitrate,
+                            sample_rate=candidate.sample_rate,
+                            format_name=candidate.format_name,
+                            kept=kept,
+                            auto_commit=False,
+                        )
+                        recorded_count += 1
+                    kept_count += 1
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to persist dedup signatures after recording {recorded_count} candidates."
+            ) from exc
         finally:
             db.close()
 
