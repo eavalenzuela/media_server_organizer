@@ -22,6 +22,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import simpleaudio
 from pydub import AudioSegment
+from src.workflows.tag_editor.runner import TagEditorWorkflow, TagUpdate
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
@@ -1745,12 +1746,15 @@ class MediaServerApp:
         self.library_context_menu.add_command(
             label="Play Audio", command=self._play_selected_library_audio
         )
+        self.library_context_menu.add_command(label="Edit Tags…", command=self._bulk_edit_selected_tags)
         self.library_context_menu.add_separator()
         self.library_context_menu.add_command(label="New Playlist...", command=self._prompt_new_playlist)
         self.library_playlist_submenu = tk.Menu(self.library_context_menu, tearoff=0)
         self.library_context_menu.add_cascade(
             label="Add to Playlist", menu=self.library_playlist_submenu
         )
+        self.search_context_menu = tk.Menu(self.root, tearoff=0)
+        self.search_context_menu.add_command(label="Edit Tags…", command=self._bulk_edit_selected_tags)
 
         self._build_menu()
         self._build_layout()
@@ -1957,7 +1961,7 @@ class MediaServerApp:
             columns=("library", "type", "path"),
             show="headings",
             height=6,
-            selectmode="browse",
+            selectmode="extended",
         )
         self.search_results.heading("library", text="Library")
         self.search_results.heading("type", text="Type")
@@ -1971,6 +1975,7 @@ class MediaServerApp:
         scroll.grid(row=0, column=1, sticky="ns")
         self.search_results.configure(yscrollcommand=scroll.set)
         self.search_results.bind("<Double-1>", self._open_search_result)
+        self.search_results.bind("<Button-3>", self._show_search_item_menu)
 
     def _build_audio_player(self) -> None:
         self.audio_player_frame = ttk.Frame(self.right_frame, padding=(8, 6))
@@ -2351,7 +2356,13 @@ class MediaServerApp:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        tree = ttk.Treeview(frame, columns=("type", "location"), show="headings", style="Library.Treeview")
+        tree = ttk.Treeview(
+            frame,
+            columns=("type", "location"),
+            show="headings",
+            style="Library.Treeview",
+            selectmode="extended",
+        )
         tree.heading("type", text="Type")
         tree.heading("location", text="Location")
         tree.column("type", width=120, anchor="w")
@@ -2622,9 +2633,19 @@ class MediaServerApp:
         selection = tree.selection()
         if not selection:
             return
-        item = tree.item(selection[0])
-        entry_type, location = item["values"]
-        self._set_metadata_rows(self._gather_metadata(location, entry_type))
+        if len(selection) == 1:
+            item = tree.item(selection[0])
+            entry_type, location = item["values"]
+            self._set_metadata_rows(self._gather_metadata(location, entry_type))
+            return
+        file_count = len(self._selected_library_file_paths())
+        self._set_metadata_rows(
+            [
+                ("Selection", f"{len(selection)} items"),
+                ("Files", str(file_count)),
+                ("Folders", str(len(selection) - file_count)),
+            ]
+        )
 
     def _on_library_item_double_click(self, _event: tk.Event) -> None:
         if not self.current_library or self.current_library.library_type != "local":
@@ -2685,6 +2706,18 @@ class MediaServerApp:
         finally:
             self.library_context_menu.grab_release()
 
+    def _show_search_item_menu(self, event: tk.Event) -> None:
+        item = self.search_results.identify_row(event.y)
+        if item:
+            selected = set(self.search_results.selection())
+            if item not in selected:
+                self.search_results.selection_set(item)
+            self.search_results.focus(item)
+        try:
+            self.search_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.search_context_menu.grab_release()
+
     def _update_folder_menu_state(self) -> None:
         path = self._get_selected_folder_path()
         self._set_menu_state(self.folder_tree_menu, path)
@@ -2740,6 +2773,91 @@ class MediaServerApp:
             return None
         entry_type, location = tree.item(selection[0], "values")
         return entry_type, location
+
+    def _selected_library_file_paths(self) -> list[str]:
+        if not self.current_library:
+            return []
+        tree = self.library_views[self.current_library.library_id]
+        paths: list[str] = []
+        for item_id in tree.selection():
+            values = tree.item(item_id, "values")
+            if len(values) < 2:
+                continue
+            entry_type, location = values
+            if entry_type == "File" and os.path.isfile(location):
+                paths.append(location)
+        return paths
+
+    def _selected_search_file_paths(self) -> list[str]:
+        paths: list[str] = []
+        for item_id in self.search_results.selection():
+            values = self.search_results.item(item_id, "values")
+            if len(values) < 3:
+                continue
+            path = values[2]
+            if os.path.isfile(path):
+                paths.append(path)
+        return paths
+
+    def _bulk_edit_selected_tags(self) -> None:
+        unique_paths = {
+            *self._selected_library_file_paths(),
+            *self._selected_search_file_paths(),
+        }
+        files = [Path(path) for path in sorted(unique_paths) if self._is_audio_file(Path(path).suffix.lower())]
+        if not files:
+            messagebox.showinfo("Edit Tags", "Select one or more audio files in library or search views.")
+            return
+
+        artist = simpledialog.askstring("Edit Tags", "Artist (blank keeps existing):", parent=self.root)
+        if artist is None:
+            return
+        album = simpledialog.askstring("Edit Tags", "Album (blank keeps existing):", parent=self.root)
+        if album is None:
+            return
+        title = simpledialog.askstring("Edit Tags", "Title (blank keeps existing):", parent=self.root)
+        if title is None:
+            return
+        track = simpledialog.askstring("Edit Tags", "Track (blank keeps existing):", parent=self.root)
+        if track is None:
+            return
+
+        updates = TagUpdate(
+            artist=(artist or "").strip() or None,
+            album=(album or "").strip() or None,
+            title=(title or "").strip() or None,
+            track=(track or "").strip() or None,
+        )
+        rename_files = messagebox.askyesno(
+            "Edit Tags",
+            "Also rename files from updated tags?",
+            parent=self.root,
+        )
+
+        workflow = TagEditorWorkflow()
+        try:
+            plan = workflow.build_plan(files, updates, rename_files)
+        except Exception as exc:
+            messagebox.showerror("Edit Tags", f"Unable to build preview: {exc}")
+            return
+        if not plan.edits:
+            messagebox.showinfo("Edit Tags", "No changes needed for selected files.")
+            return
+
+        preview = "\n".join(workflow.preview_items(plan))
+        if not messagebox.askyesno("Edit Tags Preview", f"Apply these changes?\n\n{preview}", parent=self.root):
+            return
+
+        try:
+            result = workflow.apply(plan, files[0].parent)
+        except Exception as exc:
+            logger.exception("Bulk tag edit failed")
+            messagebox.showerror("Edit Tags", f"Update failed: {exc}")
+            return
+
+        self._refresh_current_library()
+        summary = "\n".join(f"{label}: {value}" for label, value in result.summary_items)
+        messagebox.showinfo("Edit Tags", summary)
 
     def _play_selected_folder_video(self) -> None:
         path = self._get_selected_folder_path()
