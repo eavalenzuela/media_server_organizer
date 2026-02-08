@@ -109,6 +109,95 @@ class AudioSignature:
     updated_at: str | None
 
 
+@dataclass(frozen=True)
+class WatchRunHistoryEntry:
+    timestamp: str
+    status: str
+    details: str
+    rollback: str
+
+
+class EventCoalescingQueue:
+    def __init__(self, debounce_seconds: float, extensions: set[str] | None = None) -> None:
+        self.debounce_seconds = max(0.0, debounce_seconds)
+        self.extensions = {ext.lower() for ext in (extensions or set()) if ext}
+        self._pending: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def update_extensions(self, extensions: set[str]) -> None:
+        with self._lock:
+            self.extensions = {ext.lower() for ext in extensions if ext}
+
+    def enqueue(self, paths: list[str], now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            for path in paths:
+                normalized = str(Path(path).resolve())
+                extension = Path(normalized).suffix.lower()
+                if self.extensions and extension not in self.extensions:
+                    continue
+                self._pending[normalized] = current + self.debounce_seconds
+
+    def pop_ready(self, now: float | None = None) -> list[str]:
+        current = time.monotonic() if now is None else now
+        ready: list[str] = []
+        with self._lock:
+            for path, due_at in list(self._pending.items()):
+                if due_at <= current:
+                    ready.append(path)
+                    self._pending.pop(path, None)
+        return sorted(ready)
+
+
+class PollingLibraryWatcher:
+    def __init__(
+        self,
+        get_library_roots: Callable[[], list[str]],
+        on_paths_detected: Callable[[list[str]], None],
+        interval_seconds: float = 1.0,
+    ) -> None:
+        self.get_library_roots = get_library_roots
+        self.on_paths_detected = on_paths_detected
+        self.interval_seconds = max(0.25, interval_seconds)
+        self._running = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._known_paths: set[str] = set()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._running.set()
+        self._known_paths = self._scan_paths()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._running.clear()
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def _run_loop(self) -> None:
+        while self._running.is_set():
+            current_paths = self._scan_paths()
+            created_or_renamed = sorted(current_paths - self._known_paths)
+            self._known_paths = current_paths
+            if created_or_renamed:
+                self.on_paths_detected(created_or_renamed)
+            self._running.wait(self.interval_seconds)
+
+    def _scan_paths(self) -> set[str]:
+        discovered: set[str] = set()
+        for root in self.get_library_roots():
+            root_path = Path(root)
+            if not root_path.exists() or not root_path.is_dir():
+                continue
+            for path in root_path.rglob("*"):
+                if path.is_file():
+                    discovered.add(str(path.resolve()))
+        return discovered
+
+
 class LibraryDB:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -1633,7 +1722,22 @@ class MediaServerApp:
         self.audio_volume = tk.DoubleVar(value=100.0)
         self.search_var = tk.StringVar()
         self.search_status_var = tk.StringVar(value="Enter a term to search all libraries.")
+        self.watch_enabled_var = tk.BooleanVar(value=False)
+        self.watch_debounce_var = tk.StringVar(value="2.0")
+        self.watch_extensions_var = tk.StringVar(value=".mp3,.flac,.m4a,.aac,.ogg,.wav,.alac")
+        self.watch_status_var = tk.StringVar(value="Watch mode disabled.")
         self.indexed_libraries: set[int] = set()
+        self.watch_history: list[WatchRunHistoryEntry] = []
+        self.watch_history_list: ttk.Treeview | None = None
+        self.watch_task_queue = EventCoalescingQueue(
+            debounce_seconds=self._parse_debounce_seconds(),
+            extensions=self._parse_watch_extensions(),
+        )
+        self.watch_processor_job: str | None = None
+        self.library_watcher = PollingLibraryWatcher(
+            get_library_roots=self._watch_library_roots,
+            on_paths_detected=self._enqueue_watch_paths,
+        )
         self.library_context_menu = tk.Menu(self.root, tearoff=0)
         self.library_context_menu.add_command(
             label="Play Video", command=self._play_selected_library_video
@@ -1653,6 +1757,7 @@ class MediaServerApp:
         self._apply_theme(self.current_theme)
         self._load_libraries()
         self._update_playlist_menus()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_app_close)
         logger.info("MediaServerApp initialized with %s libraries", len(self.db.fetch_libraries()))
 
     def _build_menu(self) -> None:
@@ -1662,11 +1767,12 @@ class MediaServerApp:
         file_menu.add_command(label="Open Library Location", command=self._open_current_library_location)
         file_menu.add_command(label="Reload Library View", command=self._refresh_current_library)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self._on_app_close)
         menu.add_cascade(label="File", menu=file_menu)
 
         view_menu = tk.Menu(menu, tearoff=0)
         view_menu.add_command(label="Workflows...", command=self._open_workflows_dialog)
+        view_menu.add_command(label="Run History", command=self._open_watch_history_panel)
         view_menu.add_separator()
         view_menu.add_command(label="Refresh Library", command=self._refresh_current_library)
         view_menu.add_command(label="Refresh Folder Tree", command=self._refresh_folder_tree)
@@ -1816,6 +1922,29 @@ class MediaServerApp:
 
         self.search_status = ttk.Label(toolbar, textvariable=self.search_status_var, anchor="w")
         self.search_status.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+
+        watch_row = ttk.Frame(toolbar)
+        watch_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        watch_row.columnconfigure(7, weight=1)
+        ttk.Checkbutton(
+            watch_row,
+            text="Watch library",
+            variable=self.watch_enabled_var,
+            command=self._toggle_watch_mode,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(watch_row, text="Debounce (s)").grid(row=0, column=1, sticky="w", padx=(10, 4))
+        ttk.Entry(watch_row, textvariable=self.watch_debounce_var, width=6).grid(row=0, column=2, sticky="w")
+        ttk.Label(watch_row, text="Extensions").grid(row=0, column=3, sticky="w", padx=(10, 4))
+        ttk.Entry(watch_row, textvariable=self.watch_extensions_var, width=24).grid(row=0, column=4, sticky="ew")
+        ttk.Button(watch_row, text="Apply", command=self._apply_watch_settings).grid(
+            row=0, column=5, sticky="w", padx=(6, 0)
+        )
+        ttk.Button(watch_row, text="Run History", command=self._open_watch_history_panel).grid(
+            row=0, column=6, sticky="w", padx=(6, 0)
+        )
+        ttk.Label(watch_row, textvariable=self.watch_status_var).grid(
+            row=0, column=7, sticky="e", padx=(8, 0)
+        )
 
     def _build_search_results(self) -> None:
         frame = ttk.Labelframe(self.right_frame, text="Search Results", padding=6)
@@ -2094,6 +2223,128 @@ class MediaServerApp:
     def _open_workflows_dialog(self) -> None:
         dialog = WorkflowsDialog(self.root)
         self.root.wait_window(dialog)
+
+    def _parse_debounce_seconds(self) -> float:
+        try:
+            return max(0.0, float(self.watch_debounce_var.get().strip()))
+        except (AttributeError, ValueError):
+            return 2.0
+
+    def _parse_watch_extensions(self) -> set[str]:
+        raw = self.watch_extensions_var.get().strip() if hasattr(self, "watch_extensions_var") else ""
+        values = {item.strip().lower() for item in re.split(r"[,\s]+", raw) if item.strip()}
+        return {value if value.startswith(".") else f".{value}" for value in values}
+
+    def _watch_library_roots(self) -> list[str]:
+        return [library.path for library in self.db.fetch_libraries() if library.path]
+
+    def _apply_watch_settings(self) -> None:
+        debounce_seconds = self._parse_debounce_seconds()
+        extensions = self._parse_watch_extensions()
+        self.watch_task_queue.debounce_seconds = debounce_seconds
+        self.watch_task_queue.update_extensions(extensions)
+        self.watch_status_var.set(
+            f"Watch settings updated (debounce: {debounce_seconds:.1f}s, extensions: {len(extensions)})."
+        )
+
+    def _toggle_watch_mode(self) -> None:
+        if self.watch_enabled_var.get():
+            self._apply_watch_settings()
+            self.library_watcher.start()
+            self._ensure_watch_processor()
+            self.watch_status_var.set("Watch mode running.")
+        else:
+            self._stop_watch_mode()
+
+    def _stop_watch_mode(self) -> None:
+        self.library_watcher.stop()
+        if self.watch_processor_job:
+            self.root.after_cancel(self.watch_processor_job)
+            self.watch_processor_job = None
+        self.watch_enabled_var.set(False)
+        self.watch_status_var.set("Watch mode paused.")
+
+    def _on_app_close(self) -> None:
+        self._stop_watch_mode()
+        self._stop_audio(suppress_errors=True)
+        self.root.destroy()
+
+    def _enqueue_watch_paths(self, paths: list[str]) -> None:
+        self.watch_task_queue.enqueue(paths)
+
+    def _ensure_watch_processor(self) -> None:
+        if self.watch_processor_job is None:
+            self.watch_processor_job = self.root.after(500, self._process_watch_queue)
+
+    def _process_watch_queue(self) -> None:
+        self.watch_processor_job = None
+        for path in self.watch_task_queue.pop_ready():
+            self._run_watch_workflows_for_path(path)
+        if self.watch_enabled_var.get():
+            self.watch_processor_job = self.root.after(500, self._process_watch_queue)
+
+    def _run_watch_workflows_for_path(self, path: str) -> None:
+        for workflow_name in ("library_cleaner", "library_dedup"):
+            runner = load_workflow_runner(workflow_name)
+            if not runner:
+                self._append_watch_history("error", f"{workflow_name}: runner unavailable for {path}", "-")
+                continue
+            options: dict[str, str] = {"library_path": str(Path(path).parent)}
+            for option in getattr(runner, "option_definitions")():
+                options.setdefault(option.key, option.value)
+            try:
+                plan = getattr(runner, "build_plan")(options)
+                result = getattr(runner, "apply")(options, plan)
+                rollback = str(getattr(result, "rollback_script", "-") or "-")
+                self._append_watch_history("success", f"{workflow_name}: processed {path}", rollback)
+            except Exception as exc:
+                self._append_watch_history("error", f"{workflow_name}: {exc}", "-")
+
+    def _append_watch_history(self, status: str, details: str, rollback: str) -> None:
+        self.watch_history.append(
+            WatchRunHistoryEntry(
+                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                status=status,
+                details=details,
+                rollback=rollback,
+            )
+        )
+        self.watch_history = self.watch_history[-200:]
+        self._refresh_watch_history_panel()
+
+    def _open_watch_history_panel(self) -> None:
+        panel = tk.Toplevel(self.root)
+        panel.title("Watch Run History")
+        panel.geometry("860x320")
+        frame = ttk.Frame(panel, padding=10)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.watch_history_list = ttk.Treeview(
+            frame,
+            columns=("timestamp", "status", "details", "rollback"),
+            show="headings",
+            height=10,
+        )
+        for name in ("timestamp", "status", "details", "rollback"):
+            self.watch_history_list.heading(name, text=name.title())
+        self.watch_history_list.column("timestamp", width=160, anchor="w")
+        self.watch_history_list.column("status", width=80, anchor="w")
+        self.watch_history_list.column("details", width=360, anchor="w")
+        self.watch_history_list.column("rollback", width=230, anchor="w")
+        self.watch_history_list.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.watch_history_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.watch_history_list.configure(yscrollcommand=scroll.set)
+        self._refresh_watch_history_panel()
+
+    def _refresh_watch_history_panel(self) -> None:
+        if not self.watch_history_list:
+            return
+        for item in self.watch_history_list.get_children():
+            self.watch_history_list.delete(item)
+        for entry in reversed(self.watch_history):
+            self.watch_history_list.insert("", "end", values=(entry.timestamp, entry.status, entry.details, entry.rollback))
 
     def _create_library_tab(self, library: Library) -> None:
         frame = ttk.Frame(self.notebook)
