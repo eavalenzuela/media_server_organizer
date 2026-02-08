@@ -1298,6 +1298,19 @@ class WorkflowProcessWizard:
         try:
             self._plan = getattr(self.runner, "build_plan")(self._options)
             preview_items = getattr(self.runner, "preview_items")(self._plan)
+            duplicate_groups = getattr(self._plan, "duplicates", None)
+            planned_actions = getattr(self._plan, "actions", None)
+            if isinstance(duplicate_groups, list) and isinstance(planned_actions, list):
+                details: list[tuple[str, str]] = [
+                    ("Duplicate groups", str(len(duplicate_groups))),
+                    ("Planned actions", str(len(planned_actions))),
+                ]
+                preview_count = min(3, len(duplicate_groups))
+                for index, group in enumerate(duplicate_groups[:preview_count], start=1):
+                    best = getattr(group, "best", None)
+                    best_path = getattr(best, "path", None)
+                    details.append((f"Group {index} best", str(best_path) if best_path else "Unknown"))
+                preview_items = details + preview_items
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(
                 "Workflow Error",

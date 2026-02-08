@@ -3,8 +3,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +43,20 @@ class DuplicateGroup:
 class DedupPlan:
     library_root: Path
     duplicates: list[DuplicateGroup]
+    actions: list["DedupAction"]
+    mode: str
+    dry_run: bool
+    quarantine_folder: Path | None
     skipped: int
+
+
+@dataclass
+class DedupAction:
+    signature: str
+    best_path: Path
+    candidate_path: Path
+    action: str
+    destination: Path | None = None
 
 
 @dataclass
@@ -61,6 +76,9 @@ class LibraryDedupWorkflow:
             WorkflowOption("library_path", "Library path", home_music),
             WorkflowOption("extensions", "Extensions", ", ".join(sorted(SUPPORTED_EXTENSIONS))),
             WorkflowOption("use_ffprobe", "Use ffprobe (auto/true/false)", "auto"),
+            WorkflowOption("mode", "Mode (report-only/quarantine/delete)", "report-only"),
+            WorkflowOption("quarantine_folder", "Quarantine folder", ""),
+            WorkflowOption("dry_run", "Dry run (true/false)", "false"),
             WorkflowOption("db_path", "Database path", DB_DEFAULT_PATH),
         ]
 
@@ -90,27 +108,58 @@ class LibraryDedupWorkflow:
                 skipped += 1
 
         duplicates: list[DuplicateGroup] = []
+        actions: list[DedupAction] = []
         for signature, candidates in signature_groups.items():
             if len(candidates) < 2:
                 continue
             best = select_best_candidate(candidates)
             duplicates.append(DuplicateGroup(signature=signature, candidates=candidates, best=best))
 
-        return DedupPlan(library_root=library_root, duplicates=duplicates, skipped=skipped)
+            for candidate in candidates:
+                if candidate.path == best.path:
+                    continue
+                action = DedupAction(
+                    signature=signature,
+                    best_path=best.path,
+                    candidate_path=candidate.path,
+                    action=resolved["mode"],
+                )
+                if resolved["mode"] == "quarantine":
+                    quarantine_root = resolved["quarantine_folder"]
+                    if quarantine_root is None:
+                        raise ValueError("Quarantine folder is required for quarantine mode.")
+                    relative_path = candidate.path.relative_to(library_root)
+                    action.destination = resolve_collision(quarantine_root / relative_path, {
+                        item.destination for item in actions if item.destination is not None
+                    })
+                actions.append(action)
+
+        return DedupPlan(
+            library_root=library_root,
+            duplicates=duplicates,
+            actions=actions,
+            mode=resolved["mode"],
+            dry_run=resolved["dry_run"],
+            quarantine_folder=resolved["quarantine_folder"],
+            skipped=skipped,
+        )
 
     def preview_items(self, plan: DedupPlan) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [
             ("Files skipped", str(plan.skipped)),
             ("Duplicate signatures", str(len(plan.duplicates))),
+            ("Mode", plan.mode),
+            ("Dry run", str(plan.dry_run).lower()),
+            ("Planned actions", str(len(plan.actions))),
         ]
         preview_count = min(8, len(plan.duplicates))
         for group in plan.duplicates[:preview_count]:
-            best_name = group.best.path.name
+            best_name = str(group.best.path.relative_to(plan.library_root))
             other_count = len(group.candidates) - 1
             items.append(
                 (
-                    f"Keep: {best_name}",
-                    f"Discard {other_count} duplicates for signature {group.signature[:10]}...",
+                    f"Group {group.signature[:10]}...",
+                    f"Best: {best_name}; candidates: {len(group.candidates)}; actions: {other_count}",
                 )
             )
         if len(plan.duplicates) > preview_count:
@@ -119,10 +168,19 @@ class LibraryDedupWorkflow:
 
     def apply(self, options: dict[str, str], plan: DedupPlan) -> WorkflowResult:
         resolved = normalize_options(options)
+        log_dir = ensure_log_dir(plan.library_root)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"library_dedup_{timestamp}.json"
+        rollback_path = log_dir / f"library_dedup_{timestamp}_rollback.sh"
+        rollback_ps_path = log_dir / f"library_dedup_{timestamp}_rollback.ps1"
+
         db = LibraryDB(resolved["db_path"])
         library = db.find_library_by_path(str(resolved["library_path"]))
         kept_count = 0
         recorded_count = 0
+        success_actions = 0
+        error_actions = 0
+        results: list[dict[str, Any]] = []
 
         try:
             with db.transaction():
@@ -142,6 +200,26 @@ class LibraryDedupWorkflow:
                         )
                         recorded_count += 1
                     kept_count += 1
+
+            for action in plan.actions:
+                result_entry = {
+                    "signature": action.signature,
+                    "best": str(action.best_path),
+                    "candidate": str(action.candidate_path),
+                    "action": action.action,
+                    "dry_run": plan.dry_run,
+                }
+                if action.destination is not None:
+                    result_entry["destination"] = str(action.destination)
+                try:
+                    status = apply_action(action, plan.dry_run)
+                    success_actions += 1
+                    result_entry["status"] = status
+                except OSError as exc:
+                    error_actions += 1
+                    result_entry["status"] = "error"
+                    result_entry["error"] = str(exc)
+                results.append(result_entry)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to persist dedup signatures after recording {recorded_count} candidates."
@@ -149,19 +227,50 @@ class LibraryDedupWorkflow:
         finally:
             db.close()
 
+        write_rollback_script(rollback_path, results)
+        write_rollback_powershell_script(rollback_ps_path, results)
+        log_payload = {
+            "workflow": self.name,
+            "options": {key: str(value) for key, value in resolved.items()},
+            "timestamp": timestamp,
+            "results": results,
+        }
+        log_path.write_text(json.dumps(log_payload, indent=2), encoding="utf-8")
+
         summary_items = [
             ("Duplicate groups analyzed", str(len(plan.duplicates))),
             ("Best tracks recorded", str(kept_count)),
             ("Signatures stored", str(recorded_count)),
+            ("Actions attempted", str(len(plan.actions))),
+            ("Actions completed", str(success_actions)),
+            ("Action errors", str(error_actions)),
+            ("Log file", str(log_path)),
         ]
         if plan.skipped:
             summary_items.append(("Files skipped", str(plan.skipped)))
-        return WorkflowResult(summary_items=summary_items, rollback_script=None)
-
-    def rollback(self, _rollback_script: Path) -> WorkflowResult:
         return WorkflowResult(
-            summary_items=[("Rollback", "No rollback available for deduplication")],
-            rollback_script=None,
+            summary_items=summary_items,
+            rollback_script=rollback_path,
+            rollback_powershell_script=rollback_ps_path,
+        )
+
+    def rollback(self, rollback_script: Path) -> WorkflowResult:
+        if not rollback_script.exists():
+            return WorkflowResult(
+                summary_items=[("Rollback", f"Script not found: {rollback_script}")],
+                rollback_script=None,
+            )
+        try:
+            rollback_command = build_rollback_command(rollback_script)
+            subprocess.run(rollback_command, check=True)
+        except subprocess.CalledProcessError as exc:
+            return WorkflowResult(
+                summary_items=[("Rollback", f"Failed with exit code {exc.returncode}")],
+                rollback_script=rollback_script,
+            )
+        return WorkflowResult(
+            summary_items=[("Rollback", "Rollback completed successfully")],
+            rollback_script=rollback_script,
         )
 
 
@@ -194,11 +303,28 @@ def normalize_options(options: dict[str, str]) -> dict[str, Any]:
     db_path_value = options.get("db_path", DB_DEFAULT_PATH).strip()
     db_path = Path(os.path.expanduser(db_path_value)).resolve()
 
+    mode = options.get("mode", "report-only").strip().lower()
+    if mode not in {"report-only", "quarantine", "delete"}:
+        raise ValueError("Mode must be report-only, quarantine, or delete.")
+
+    quarantine_value = options.get("quarantine_folder", "").strip()
+    quarantine_folder: Path | None = None
+    if mode == "quarantine":
+        quarantine_folder = Path(os.path.expanduser(quarantine_value)).resolve() if quarantine_value else library_path / ".library_dedup" / "quarantine"
+
+    dry_run_value = options.get("dry_run", "false").strip().lower()
+    if dry_run_value not in {"true", "false"}:
+        raise ValueError("Dry run must be true or false.")
+    dry_run = dry_run_value == "true"
+
     return {
         "library_path": library_path,
         "extensions": extensions,
         "use_ffprobe": use_ffprobe,
         "db_path": db_path,
+        "mode": mode,
+        "quarantine_folder": quarantine_folder,
+        "dry_run": dry_run,
     }
 
 
@@ -210,6 +336,94 @@ def scan_library(library_root: Path, extensions: set[str]) -> list[Path]:
             if path.suffix.lower() in extensions:
                 files.append(path)
     return files
+
+
+def resolve_collision(destination: Path, planned_destinations: set[Path]) -> Path:
+    if destination not in planned_destinations and not destination.exists():
+        return destination
+
+    parent = destination.parent
+    stem = destination.stem
+    suffix = destination.suffix
+    counter = 1
+    while True:
+        candidate = parent / f"{stem} ({counter}){suffix}"
+        if candidate not in planned_destinations and not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def apply_action(action: DedupAction, dry_run: bool) -> str:
+    if action.action == "report-only" or dry_run:
+        return "dry-run" if dry_run else "reported"
+    if action.action == "quarantine":
+        if action.destination is None:
+            raise ValueError("Quarantine action is missing a destination.")
+        action.destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(action.candidate_path), str(action.destination))
+        return "moved"
+    if action.action == "delete":
+        action.candidate_path.unlink()
+        return "deleted"
+    raise ValueError(f"Unsupported action: {action.action}")
+
+
+def ensure_log_dir(library_root: Path) -> Path:
+    log_dir = library_root / ".library_dedup"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) -> None:
+    lines = ["#!/usr/bin/env sh", "set -eu", ""]
+    for entry in results:
+        if entry.get("status") != "moved":
+            continue
+        candidate = entry["candidate"]
+        destination = entry.get("destination")
+        if not destination:
+            continue
+        lines.append(f"if [ -e {json.dumps(destination)} ]; then")
+        lines.append(f"  mkdir -p {json.dumps(os.path.dirname(candidate))}")
+        lines.append(f"  mv {json.dumps(destination)} {json.dumps(candidate)}")
+        lines.append("fi")
+    rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rollback_path.chmod(0o755)
+
+
+def write_rollback_powershell_script(
+    rollback_path: Path, results: list[dict[str, Any]]
+) -> None:
+    lines = ["$ErrorActionPreference = 'Stop'", ""]
+    for entry in results:
+        if entry.get("status") != "moved":
+            continue
+        candidate = entry["candidate"]
+        destination = entry.get("destination")
+        if not destination:
+            continue
+        lines.append(f"if (Test-Path -LiteralPath {json.dumps(destination)}) {{")
+        lines.append(
+            f"  New-Item -ItemType Directory -Path {json.dumps(os.path.dirname(candidate))} -Force | Out-Null"
+        )
+        lines.append(
+            f"  Move-Item -LiteralPath {json.dumps(destination)} -Destination {json.dumps(candidate)} -Force"
+        )
+        lines.append("}")
+    rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_rollback_command(rollback_script: Path) -> list[str]:
+    if os.name == "nt":
+        return [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(rollback_script),
+        ]
+    return ["/bin/sh", str(rollback_script)]
 
 
 def compute_audio_signature(path: Path) -> str:
@@ -319,11 +533,19 @@ def build_options_dict(option_pairs: list[tuple[str, str]]) -> dict[str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Library deduplication workflow runner")
-    parser.add_argument("action", choices=["plan", "apply"], help="Action to perform")
+    parser.add_argument("action", choices=["plan", "apply", "rollback"], help="Action to perform")
     parser.add_argument("--options", help="Path to JSON file with options")
+    parser.add_argument("--rollback-script", help="Path to rollback script")
     args = parser.parse_args()
 
     workflow = create_workflow()
+
+    if args.action == "rollback":
+        if not args.rollback_script:
+            raise SystemExit("--rollback-script is required for rollback action")
+        result = workflow.rollback(Path(args.rollback_script))
+        print(json.dumps(result.summary_items, indent=2))
+        return
 
     if not args.options:
         raise SystemExit("--options is required for plan/apply action")
