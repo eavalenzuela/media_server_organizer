@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import threading
+import traceback
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -150,10 +151,49 @@ def load_workflow_runner(workflow_name: str) -> object | None:
     if not spec or not spec.loader:
         return None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        logger.error(
+            "Failed to execute workflow module: %s",
+            {
+                "workflow_name": workflow_name,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+        return None
     create_workflow = getattr(module, "create_workflow", None)
     if callable(create_workflow):
-        return create_workflow()
+        try:
+            workflow = create_workflow()
+        except Exception as exc:
+            logger.error(
+                "Failed to create workflow runner: %s",
+                {
+                    "workflow_name": workflow_name,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+            return None
+
+        required_methods = ("option_definitions", "build_plan", "apply")
+        missing_methods = [
+            method_name
+            for method_name in required_methods
+            if not callable(getattr(workflow, method_name, None))
+        ]
+        if missing_methods:
+            logger.error(
+                "Workflow runner interface validation failed: %s",
+                {
+                    "workflow_name": workflow_name,
+                    "missing_methods": missing_methods,
+                },
+            )
+            return None
+        return workflow
     return None
 
 
