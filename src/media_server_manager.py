@@ -24,6 +24,18 @@ from typing import TYPE_CHECKING
 from pydub import AudioSegment
 from src.workflows.tag_editor.runner import TagEditorWorkflow, TagUpdate
 
+WATCHDOG_AVAILABLE = (
+    importlib.util.find_spec("watchdog.events") is not None
+    and importlib.util.find_spec("watchdog.observers") is not None
+)
+if WATCHDOG_AVAILABLE:
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+else:
+    FileSystemEvent = object
+    FileSystemEventHandler = object
+    Observer = object
+
 if TYPE_CHECKING:
     import simpleaudio
 
@@ -213,20 +225,41 @@ class PollingLibraryWatcher:
         self,
         get_library_roots: Callable[[], list[str]],
         on_paths_detected: Callable[[list[str]], None],
-        interval_seconds: float = 1.0,
+        interval_seconds: float = 0.05,
+        max_scan_interval_seconds: float = 30.0,
+        on_status: Callable[[str], None] | None = None,
     ) -> None:
         self.get_library_roots = get_library_roots
         self.on_paths_detected = on_paths_detected
-        self.interval_seconds = max(0.25, interval_seconds)
+        self.interval_seconds = max(0.05, interval_seconds)
+        self.max_scan_interval_seconds = max(0.05, max_scan_interval_seconds)
+        self.on_status = on_status
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
         self._known_paths: set[str] = set()
+        self._known_dirs: set[str] = set()
+        self._dir_mtimes: dict[str, float] = {}
+        self._dir_children: dict[str, set[str]] = {}
+        self._dir_files: dict[str, set[str]] = {}
+        self._observer: Observer | None = None
+        self._event_handler: _WatchdogEventHandler | None = None
+        self._watch_mode = "polling"
+
+    def configure(self, max_scan_interval_seconds: float) -> None:
+        self.max_scan_interval_seconds = max(0.05, max_scan_interval_seconds)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._running.set()
-        self._known_paths = self._scan_paths()
+        self._known_paths = set()
+        self._known_dirs = set()
+        self._dir_mtimes.clear()
+        self._dir_children.clear()
+        self._dir_files.clear()
+        self._emit_status("Starting library watch…")
+        self._setup_watchdog()
+        self._scan_paths(force_full=True)
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -235,26 +268,161 @@ class PollingLibraryWatcher:
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=timeout)
+        self._teardown_watchdog()
 
     def _run_loop(self) -> None:
         while self._running.is_set():
-            current_paths = self._scan_paths()
-            created_or_renamed = sorted(current_paths - self._known_paths)
-            self._known_paths = current_paths
+            scan_started = time.monotonic()
+            created_or_renamed = self._scan_paths(force_full=False)
             if created_or_renamed:
                 self.on_paths_detected(created_or_renamed)
-            self._running.wait(self.interval_seconds)
+            elapsed = time.monotonic() - scan_started
+            effective_interval = max(self.interval_seconds, self.max_scan_interval_seconds)
+            wait_seconds = max(0.0, effective_interval - elapsed)
+            self._running.wait(wait_seconds)
 
-    def _scan_paths(self) -> set[str]:
-        discovered: set[str] = set()
+    def _setup_watchdog(self) -> None:
+        self._watch_mode = "polling"
+        if not WATCHDOG_AVAILABLE:
+            self._emit_status("Watch mode active (polling fallback: install watchdog for event-based updates).")
+            return
+        roots = self._resolve_roots()
+        if not roots:
+            return
+        observer = Observer()
+        handler = _WatchdogEventHandler(self.on_paths_detected)
+        watches = 0
+        for root in roots:
+            try:
+                observer.schedule(handler, root, recursive=True)
+                watches += 1
+            except OSError:
+                continue
+        if watches == 0:
+            self._emit_status("Watch mode active (polling fallback: unable to subscribe to library roots).")
+            return
+        observer.start()
+        self._observer = observer
+        self._event_handler = handler
+        self._watch_mode = "event+poll"
+        self._emit_status(f"Watch mode active (event+poll across {watches} roots).")
+
+    def _teardown_watchdog(self) -> None:
+        if self._observer is None:
+            return
+        self._observer.stop()
+        self._observer.join(timeout=2.0)
+        self._observer = None
+        self._event_handler = None
+
+    def _resolve_roots(self) -> list[str]:
+        roots: list[str] = []
         for root in self.get_library_roots():
             root_path = Path(root)
-            if not root_path.exists() or not root_path.is_dir():
+            if root_path.exists() and root_path.is_dir():
+                roots.append(str(root_path.resolve()))
+        return sorted(set(roots))
+
+    def _scan_paths(self, force_full: bool) -> list[str]:
+        roots = self._resolve_roots()
+        active_roots = set(roots)
+        stale_dirs = [
+            path
+            for path in self._known_dirs
+            if not any(path.startswith(f"{root}{os.sep}") or path == root for root in active_roots)
+        ]
+        for stale_dir in stale_dirs:
+            self._drop_directory_state(stale_dir)
+
+        created_or_renamed: set[str] = set()
+        listed_directories = 0
+        for root in roots:
+            listed_directories += self._scan_directory_tree(root, created_or_renamed, force_full)
+
+        self._emit_status(
+            f"Watch mode {self._watch_mode}: {len(self._known_paths):,} files tracked across {len(self._known_dirs):,} directories "
+            f"({listed_directories:,} directories listed this cycle)."
+        )
+        return sorted(created_or_renamed)
+
+    def _scan_directory_tree(self, directory: str, detected_paths: set[str], force_full: bool) -> int:
+        listed_directories = 0
+        stack: list[str] = [directory]
+        while stack:
+            current = stack.pop()
+            try:
+                stat_result = os.stat(current)
+            except OSError:
+                self._drop_directory_state(current)
                 continue
-            for path in root_path.rglob("*"):
-                if path.is_file():
-                    discovered.add(str(path.resolve()))
-        return discovered
+
+            previous_mtime = self._dir_mtimes.get(current)
+            should_list = force_full or previous_mtime is None or stat_result.st_mtime != previous_mtime
+            self._dir_mtimes[current] = stat_result.st_mtime
+            self._known_dirs.add(current)
+
+            if should_list:
+                listed_directories += 1
+                child_dirs: set[str] = set()
+                child_files: set[str] = set()
+                try:
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            resolved = str(Path(entry.path).resolve())
+                            if entry.is_dir(follow_symlinks=False):
+                                child_dirs.add(resolved)
+                            elif entry.is_file(follow_symlinks=False):
+                                child_files.add(resolved)
+                except OSError:
+                    continue
+
+                previous_child_dirs = self._dir_children.get(current, set())
+                previous_child_files = self._dir_files.get(current, set())
+                for removed_dir in previous_child_dirs - child_dirs:
+                    self._drop_directory_state(removed_dir)
+                for removed_file in previous_child_files - child_files:
+                    self._known_paths.discard(removed_file)
+
+                detected_paths.update(child_files - previous_child_files)
+                self._dir_children[current] = child_dirs
+                self._dir_files[current] = child_files
+                self._known_paths.update(child_files)
+
+            stack.extend(sorted(self._dir_children.get(current, set())))
+
+        return listed_directories
+
+    def _drop_directory_state(self, directory: str) -> None:
+        for child in list(self._dir_children.get(directory, set())):
+            self._drop_directory_state(child)
+        for file_path in self._dir_files.get(directory, set()):
+            self._known_paths.discard(file_path)
+        self._known_dirs.discard(directory)
+        self._dir_mtimes.pop(directory, None)
+        self._dir_children.pop(directory, None)
+        self._dir_files.pop(directory, None)
+
+    def _emit_status(self, status: str) -> None:
+        if self.on_status:
+            self.on_status(status)
+
+
+class _WatchdogEventHandler(FileSystemEventHandler):
+    def __init__(self, on_paths_detected: Callable[[list[str]], None]) -> None:
+        self.on_paths_detected = on_paths_detected
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        paths: list[str] = []
+        src_path = getattr(event, "src_path", None)
+        dest_path = getattr(event, "dest_path", None)
+        if src_path:
+            paths.append(str(Path(src_path).resolve()))
+        if dest_path:
+            paths.append(str(Path(dest_path).resolve()))
+        if paths:
+            self.on_paths_detected(paths)
 
 
 class LibraryDB:
@@ -1783,6 +1951,7 @@ class MediaServerApp:
         self.search_status_var = tk.StringVar(value="Enter a term to search all libraries.")
         self.watch_enabled_var = tk.BooleanVar(value=False)
         self.watch_debounce_var = tk.StringVar(value="2.0")
+        self.watch_poll_max_hz_var = tk.StringVar(value="1.0")
         self.watch_extensions_var = tk.StringVar(value=".mp3,.flac,.m4a,.aac,.ogg,.wav,.alac")
         self.watch_status_var = tk.StringVar(value="Watch mode disabled.")
         self.indexed_libraries: set[int] = set()
@@ -1796,6 +1965,7 @@ class MediaServerApp:
         self.library_watcher = PollingLibraryWatcher(
             get_library_roots=self._watch_library_roots,
             on_paths_detected=self._enqueue_watch_paths,
+            on_status=self._set_watch_status,
         )
         self.library_context_menu = tk.Menu(self.root, tearoff=0)
         self.library_context_menu.add_command(
@@ -1987,7 +2157,7 @@ class MediaServerApp:
 
         watch_row = ttk.Frame(toolbar)
         watch_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        watch_row.columnconfigure(7, weight=1)
+        watch_row.columnconfigure(9, weight=1)
         ttk.Checkbutton(
             watch_row,
             text="Watch library",
@@ -1998,14 +2168,16 @@ class MediaServerApp:
         ttk.Entry(watch_row, textvariable=self.watch_debounce_var, width=6).grid(row=0, column=2, sticky="w")
         ttk.Label(watch_row, text="Extensions").grid(row=0, column=3, sticky="w", padx=(10, 4))
         ttk.Entry(watch_row, textvariable=self.watch_extensions_var, width=24).grid(row=0, column=4, sticky="ew")
+        ttk.Label(watch_row, text="Max scans/s").grid(row=0, column=5, sticky="w", padx=(10, 4))
+        ttk.Entry(watch_row, textvariable=self.watch_poll_max_hz_var, width=6).grid(row=0, column=6, sticky="w")
         ttk.Button(watch_row, text="Apply", command=self._apply_watch_settings).grid(
-            row=0, column=5, sticky="w", padx=(6, 0)
+            row=0, column=7, sticky="w", padx=(6, 0)
         )
         ttk.Button(watch_row, text="Run History", command=self._open_watch_history_panel).grid(
-            row=0, column=6, sticky="w", padx=(6, 0)
+            row=0, column=8, sticky="w", padx=(6, 0)
         )
         ttk.Label(watch_row, textvariable=self.watch_status_var).grid(
-            row=0, column=7, sticky="e", padx=(8, 0)
+            row=0, column=9, sticky="e", padx=(8, 0)
         )
 
     def _build_search_results(self) -> None:
@@ -2293,6 +2465,12 @@ class MediaServerApp:
         except (AttributeError, ValueError):
             return 2.0
 
+    def _parse_watch_poll_max_hz(self) -> float:
+        try:
+            return min(20.0, max(0.1, float(self.watch_poll_max_hz_var.get().strip())))
+        except (AttributeError, ValueError):
+            return 1.0
+
     def _parse_watch_extensions(self) -> set[str]:
         raw = self.watch_extensions_var.get().strip() if hasattr(self, "watch_extensions_var") else ""
         values = {item.strip().lower() for item in re.split(r"[,\s]+", raw) if item.strip()}
@@ -2304,10 +2482,12 @@ class MediaServerApp:
     def _apply_watch_settings(self) -> None:
         debounce_seconds = self._parse_debounce_seconds()
         extensions = self._parse_watch_extensions()
+        poll_max_hz = self._parse_watch_poll_max_hz()
         self.watch_task_queue.debounce_seconds = debounce_seconds
         self.watch_task_queue.update_extensions(extensions)
-        self.watch_status_var.set(
-            f"Watch settings updated (debounce: {debounce_seconds:.1f}s, extensions: {len(extensions)})."
+        self.library_watcher.configure(max_scan_interval_seconds=1.0 / poll_max_hz)
+        self._set_watch_status(
+            f"Watch settings updated (debounce: {debounce_seconds:.1f}s, extensions: {len(extensions)}, max scans/s: {poll_max_hz:.1f})."
         )
 
     def _toggle_watch_mode(self) -> None:
@@ -2315,7 +2495,7 @@ class MediaServerApp:
             self._apply_watch_settings()
             self.library_watcher.start()
             self._ensure_watch_processor()
-            self.watch_status_var.set("Watch mode running.")
+            self._set_watch_status("Watch mode running.")
         else:
             self._stop_watch_mode()
 
@@ -2325,7 +2505,13 @@ class MediaServerApp:
             self.root.after_cancel(self.watch_processor_job)
             self.watch_processor_job = None
         self.watch_enabled_var.set(False)
-        self.watch_status_var.set("Watch mode paused.")
+        self._set_watch_status("Watch mode paused.")
+
+    def _set_watch_status(self, status: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.watch_status_var.set(status)
+            return
+        self.root.after(0, lambda: self.watch_status_var.set(status))
 
     def _on_app_close(self) -> None:
         self._stop_watch_mode()
