@@ -19,10 +19,13 @@ from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+from typing import TYPE_CHECKING
 
-import simpleaudio
 from pydub import AudioSegment
 from src.workflows.tag_editor.runner import TagEditorWorkflow, TagUpdate
+
+if TYPE_CHECKING:
+    import simpleaudio
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
@@ -68,6 +71,61 @@ def configure_logging(level: str | int = "INFO") -> Path:
 
 
 logger = logging.getLogger(__name__)
+
+AUDIO_BACKENDS = ("simpleaudio", "sounddevice")
+
+
+def _backend_dependency_error(backend: str) -> str | None:
+    if backend == "simpleaudio":
+        try:
+            import simpleaudio  # noqa: F401
+        except ImportError:
+            return "simpleaudio is not installed. Install it to use this backend."
+        return None
+    if backend == "sounddevice":
+        missing: list[str] = []
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            missing.append("numpy")
+        try:
+            import sounddevice  # noqa: F401
+        except ImportError:
+            missing.append("sounddevice")
+        if missing:
+            joined = ", ".join(missing)
+            return f"The sounddevice backend requires: {joined}."
+        return None
+    return f"Unsupported audio backend: {backend}."
+
+
+def resolve_audio_backend(requested_backend: str, emit_message: Callable[[str], None] | None = None) -> str:
+    selected = requested_backend if requested_backend in AUDIO_BACKENDS else "simpleaudio"
+    if selected != requested_backend and emit_message:
+        emit_message(
+            f"Unknown audio backend '{requested_backend}'. Falling back to '{selected}'."
+        )
+
+    fallback_order = [selected, *(backend for backend in AUDIO_BACKENDS if backend != selected)]
+    selected_error: str | None = None
+    for backend in fallback_order:
+        error = _backend_dependency_error(backend)
+        if error is None:
+            if backend != selected and emit_message:
+                emit_message(
+                    f"Audio backend '{selected}' is unavailable ({selected_error}). "
+                    f"Falling back to '{backend}'."
+                )
+            return backend
+        if backend == selected:
+            selected_error = error
+
+    if emit_message:
+        emit_message(
+            "No supported audio backend is currently available. "
+            "Install 'simpleaudio' or install both 'sounddevice' and 'numpy'."
+        )
+    return selected
 
 
 def load_workflow_runner(workflow_name: str) -> object | None:
@@ -1711,8 +1769,8 @@ class MediaServerApp:
         self.current_library: Library | None = None
         self.audio_segment: AudioSegment | None = None
         self.audio_segment_path: str | None = None
-        self.audio_play_obj: simpleaudio.PlayObject | SoundDevicePlayObject | None = None
-        self.audio_backend = audio_backend if audio_backend in {"simpleaudio", "sounddevice"} else "simpleaudio"
+        self.audio_play_obj: object | SoundDevicePlayObject | None = None
+        self.audio_backend = resolve_audio_backend(audio_backend, emit_message=logger.warning)
         self.audio_path: str | None = None
         self.audio_paused_position_ms = 0
         self.audio_playback_start_time: float | None = None
@@ -2991,7 +3049,13 @@ class MediaServerApp:
             return self._play_with_sounddevice(segment)
         return self._play_with_simpleaudio(segment)
 
-    def _play_with_simpleaudio(self, segment: AudioSegment) -> simpleaudio.PlayObject:
+    def _play_with_simpleaudio(self, segment: AudioSegment) -> object:
+        try:
+            import simpleaudio
+        except ImportError as exc:
+            raise RuntimeError(
+                "simpleaudio is not installed. Install it or choose the sounddevice backend."
+            ) from exc
         return simpleaudio.play_buffer(
             segment.raw_data,
             num_channels=segment.channels,
@@ -3004,13 +3068,13 @@ class MediaServerApp:
             import numpy as np
         except ImportError as exc:
             raise RuntimeError(
-                "The sounddevice backend requires numpy. Install it or use the simpleaudio backend."
+                "The sounddevice backend requires numpy. Install it or choose the simpleaudio backend."
             ) from exc
         try:
             import sounddevice as sd
         except ImportError as exc:
             raise RuntimeError(
-                "sounddevice is not installed. Install it or use the simpleaudio backend."
+                "sounddevice is not installed. Install it or choose the simpleaudio backend."
             ) from exc
 
         if hasattr(segment, "get_array_of_samples"):
@@ -3536,12 +3600,22 @@ def run() -> None:
     )
     args = parser.parse_args()
 
+    startup_messages: list[str] = []
+    resolved_audio_backend = resolve_audio_backend(
+        args.audio_backend,
+        emit_message=startup_messages.append,
+    )
+
     log_file = configure_logging(args.log_level)
     logger.info("Using database at %s", args.db)
     logger.info("Log file: %s", log_file)
-    logger.info("Audio backend: %s", args.audio_backend)
+    for message in startup_messages:
+        logger.warning(message)
+    logger.info("Audio backend: %s", resolved_audio_backend)
 
     if args.nogui:
+        for message in startup_messages:
+            print(f"Audio backend warning: {message}")
         print("GUI disabled. Provide --db to change database location.")
         logger.info("Running in CLI-only mode; GUI disabled")
         return
@@ -3549,7 +3623,13 @@ def run() -> None:
     root = tk.Tk()
     db = LibraryDB(args.db)
     try:
-        MediaServerApp(root, db, audio_backend=args.audio_backend)
+        if startup_messages:
+            messagebox.showwarning(
+                "Audio Backend Fallback",
+                "\n".join(startup_messages),
+                parent=root,
+            )
+        MediaServerApp(root, db, audio_backend=resolved_audio_backend)
         root.mainloop()
     finally:
         db.close()
