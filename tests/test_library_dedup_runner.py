@@ -13,6 +13,7 @@ from src.workflows.library_dedup.runner import (
     DuplicateGroup,
     LibraryDedupWorkflow,
     apply_action,
+    fallback_audio_quality,
     write_rollback_powershell_script,
     write_rollback_script,
 )
@@ -260,3 +261,51 @@ def test_rollback_scripts_restore_moved_delete_entries(tmp_path):
         f"Move-Item -LiteralPath {json.dumps(str(destination))} -Destination {json.dumps(str(source))} -Force"
         in ps_content
     )
+
+
+def test_fallback_audio_quality_accounts_for_channel_count(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.wav"
+    sample.write_bytes(b"stub")
+
+    class _Audio:
+        frame_rate = 48000
+        sample_width = 2
+        channels = 1
+
+    monkeypatch.setattr("src.workflows.library_dedup.runner.importlib.util.find_spec", lambda _name: object())
+    monkeypatch.setattr("pydub.AudioSegment.from_file", lambda _path: _Audio())
+
+    mono_bitrate, sample_rate, format_name = fallback_audio_quality(sample)
+    assert mono_bitrate == 48000 * 2 * 1 * 8
+    assert sample_rate == 48000
+    assert format_name == "wav"
+
+    _Audio.channels = 2
+    stereo_bitrate, _, _ = fallback_audio_quality(sample)
+    assert stereo_bitrate == 48000 * 2 * 2 * 8
+
+
+def test_fallback_audio_quality_returns_none_bitrate_when_fields_missing(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.wav"
+    sample.write_bytes(b"stub")
+
+    class _Audio:
+        frame_rate = 44100
+        sample_width = 2
+        channels = 2
+
+    monkeypatch.setattr("src.workflows.library_dedup.runner.importlib.util.find_spec", lambda _name: object())
+    monkeypatch.setattr("pydub.AudioSegment.from_file", lambda _path: _Audio())
+
+    assert fallback_audio_quality(sample)[0] == 44100 * 2 * 2 * 8
+
+    _Audio.channels = 0
+    assert fallback_audio_quality(sample)[0] is None
+
+    _Audio.channels = 2
+    _Audio.sample_width = 0
+    assert fallback_audio_quality(sample)[0] is None
+
+    _Audio.sample_width = 2
+    _Audio.frame_rate = 0
+    assert fallback_audio_quality(sample)[0] is None

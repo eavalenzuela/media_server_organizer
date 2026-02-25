@@ -509,8 +509,11 @@ def fallback_audio_quality(path: Path) -> tuple[int | None, int | None, str | No
     try:
         audio = AudioSegment.from_file(path)
         bitrate = None
-        if audio.frame_rate and audio.sample_width:
-            bitrate = audio.frame_rate * audio.sample_width * 8
+        frame_rate = getattr(audio, "frame_rate", None)
+        sample_width = getattr(audio, "sample_width", None)
+        channels = getattr(audio, "channels", None)
+        if frame_rate and sample_width and channels:
+            bitrate = frame_rate * sample_width * channels * 8
         return bitrate, audio.frame_rate or None, format_name
     except Exception:
         return None, None, format_name
