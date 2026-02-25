@@ -51,6 +51,7 @@ class DedupPlan:
     dry_run: bool
     quarantine_folder: Path | None
     skipped: int
+    delete_backup_folder: Path | None
 
 
 @dataclass
@@ -135,6 +136,15 @@ class LibraryDedupWorkflow:
                     action.destination = resolve_collision(quarantine_root / relative_path, {
                         item.destination for item in actions if item.destination is not None
                     })
+                if resolved["mode"] == "delete":
+                    delete_backup_root = resolved["delete_backup_folder"]
+                    if delete_backup_root is None:
+                        raise ValueError("Delete backup folder is required for delete mode.")
+                    relative_path = candidate.path.relative_to(library_root)
+                    action.destination = resolve_collision(
+                        delete_backup_root / relative_path,
+                        {item.destination for item in actions if item.destination is not None},
+                    )
                 actions.append(action)
 
         return DedupPlan(
@@ -145,6 +155,7 @@ class LibraryDedupWorkflow:
             dry_run=resolved["dry_run"],
             quarantine_folder=resolved["quarantine_folder"],
             skipped=skipped,
+            delete_backup_folder=resolved["delete_backup_folder"],
         )
 
     def preview_items(self, plan: DedupPlan) -> list[tuple[str, str]]:
@@ -320,6 +331,10 @@ def normalize_options(options: dict[str, str]) -> dict[str, Any]:
     if mode == "quarantine":
         quarantine_folder = Path(os.path.expanduser(quarantine_value)).resolve() if quarantine_value else library_path / ".library_dedup" / "quarantine"
 
+    delete_backup_folder: Path | None = None
+    if mode == "delete":
+        delete_backup_folder = library_path / ".library_dedup" / "delete_backup"
+
     dry_run_value = options.get("dry_run", "false").strip().lower()
     if dry_run_value not in {"true", "false"}:
         raise ValueError("Dry run must be true or false.")
@@ -332,6 +347,7 @@ def normalize_options(options: dict[str, str]) -> dict[str, Any]:
         "db_path": db_path,
         "mode": mode,
         "quarantine_folder": quarantine_folder,
+        "delete_backup_folder": delete_backup_folder,
         "dry_run": dry_run,
     }
 
@@ -371,8 +387,11 @@ def apply_action(action: DedupAction, dry_run: bool) -> str:
         shutil.move(str(action.candidate_path), str(action.destination))
         return "moved"
     if action.action == "delete":
-        action.candidate_path.unlink()
-        return "deleted"
+        if action.destination is None:
+            raise ValueError("Delete action is missing a backup destination.")
+        action.destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(action.candidate_path), str(action.destination))
+        return "moved"
     raise ValueError(f"Unsupported action: {action.action}")
 
 

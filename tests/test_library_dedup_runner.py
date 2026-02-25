@@ -13,6 +13,7 @@ from src.workflows.library_dedup.runner import (
     DuplicateGroup,
     LibraryDedupWorkflow,
     apply_action,
+    write_rollback_powershell_script,
     write_rollback_script,
 )
 
@@ -50,6 +51,7 @@ def test_apply_persists_expected_signature_rows(tmp_path):
         dry_run=False,
         quarantine_folder=None,
         skipped=0,
+        delete_backup_folder=None,
     )
 
     result = workflow.apply(
@@ -91,6 +93,7 @@ def test_apply_rolls_back_transaction_when_upsert_fails(tmp_path, monkeypatch):
         dry_run=False,
         quarantine_folder=None,
         skipped=0,
+        delete_backup_folder=None,
     )
 
     original_upsert = LibraryDB.upsert_audio_signature
@@ -158,9 +161,12 @@ def test_apply_action_delete_and_quarantine_behaviors(tmp_path):
         candidate_path=file_to_delete,
         action="delete",
     )
+    delete_backup = tmp_path / "backup" / "delete.mp3"
+    delete_action.destination = delete_backup
     status = apply_action(delete_action, dry_run=False)
-    assert status == "deleted"
+    assert status == "moved"
     assert not file_to_delete.exists()
+    assert delete_backup.exists()
 
     source = tmp_path / "source.mp3"
     source.write_bytes(b"y")
@@ -196,3 +202,61 @@ def test_write_rollback_script_contains_quarantine_reversal(tmp_path):
 
     content = rollback_script.read_text(encoding="utf-8")
     assert f"mv {json.dumps(str(destination))} {json.dumps(str(source))}" in content
+
+
+def test_build_plan_creates_delete_backup_actions(tmp_path, monkeypatch):
+    workflow = LibraryDedupWorkflow()
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "best.mp3").write_bytes(b"same-content")
+    (library / "dup.mp3").write_bytes(b"same-content")
+
+    monkeypatch.setattr(
+        "src.workflows.library_dedup.runner.extract_audio_quality",
+        lambda _path, _use_ffprobe: (320000, 44100, "mp3"),
+    )
+
+    plan = workflow.build_plan(
+        {
+            "library_path": str(library),
+            "extensions": ".mp3",
+            "use_ffprobe": "false",
+            "mode": "delete",
+            "dry_run": "false",
+            "db_path": str(tmp_path / "dedup.db"),
+        }
+    )
+
+    assert len(plan.actions) == 1
+    action = plan.actions[0]
+    assert action.action == "delete"
+    assert action.destination is not None
+    assert ".library_dedup" in str(action.destination)
+    assert "delete_backup" in str(action.destination)
+
+
+def test_rollback_scripts_restore_moved_delete_entries(tmp_path):
+    rollback_sh = tmp_path / "rollback.sh"
+    rollback_ps1 = tmp_path / "rollback.ps1"
+    source = tmp_path / "library" / "dup.mp3"
+    destination = tmp_path / ".library_dedup" / "delete_backup" / "dup.mp3"
+
+    entries = [
+        {
+            "candidate": str(source),
+            "destination": str(destination),
+            "status": "moved",
+        }
+    ]
+
+    write_rollback_script(rollback_sh, entries)
+    write_rollback_powershell_script(rollback_ps1, entries)
+
+    sh_content = rollback_sh.read_text(encoding="utf-8")
+    ps_content = rollback_ps1.read_text(encoding="utf-8")
+
+    assert f"mv {json.dumps(str(destination))} {json.dumps(str(source))}" in sh_content
+    assert (
+        f"Move-Item -LiteralPath {json.dumps(str(destination))} -Destination {json.dumps(str(source))} -Force"
+        in ps_content
+    )
