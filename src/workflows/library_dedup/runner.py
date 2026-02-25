@@ -186,23 +186,28 @@ class LibraryDedupWorkflow:
         results: list[dict[str, Any]] = []
 
         try:
-            with db.transaction():
-                for group in plan.duplicates:
-                    best = group.best
-                    for candidate in group.candidates:
-                        kept = candidate.path == best.path
-                        db.upsert_audio_signature(
-                            path=str(candidate.path),
-                            signature=candidate.signature,
-                            library_id=library.library_id if library else None,
-                            bitrate=candidate.bitrate,
-                            sample_rate=candidate.sample_rate,
-                            format_name=candidate.format_name,
-                            kept=kept,
-                            auto_commit=False,
-                        )
-                        recorded_count += 1
-                    kept_count += 1
+            try:
+                with db.transaction():
+                    for group in plan.duplicates:
+                        best = group.best
+                        for candidate in group.candidates:
+                            kept = candidate.path == best.path
+                            db.upsert_audio_signature(
+                                path=str(candidate.path),
+                                signature=candidate.signature,
+                                library_id=library.library_id if library else None,
+                                bitrate=candidate.bitrate,
+                                sample_rate=candidate.sample_rate,
+                                format_name=candidate.format_name,
+                                kept=kept,
+                                auto_commit=False,
+                            )
+                            recorded_count += 1
+                        kept_count += 1
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to persist dedup signatures after recording {recorded_count} candidates."
+                ) from exc
 
             for action in plan.actions:
                 result_entry = {
@@ -222,11 +227,11 @@ class LibraryDedupWorkflow:
                     error_actions += 1
                     result_entry["status"] = "error"
                     result_entry["error"] = str(exc)
+                except Exception as exc:
+                    error_actions += 1
+                    result_entry["status"] = "error"
+                    result_entry["error"] = str(exc)
                 results.append(result_entry)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to persist dedup signatures after recording {recorded_count} candidates."
-            ) from exc
         finally:
             db.close()
 
