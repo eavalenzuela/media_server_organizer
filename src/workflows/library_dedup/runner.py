@@ -10,7 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from media_server_manager import DB_DEFAULT_PATH, LibraryDB
+try:
+    from src.media_server_manager import DB_DEFAULT_PATH, LibraryDB
+except ModuleNotFoundError:  # Script-style execution fallback.
+    from media_server_manager import DB_DEFAULT_PATH, LibraryDB
 
 SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".alac"}
 

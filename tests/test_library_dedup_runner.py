@@ -1,13 +1,10 @@
 import json
 from pathlib import Path
-import sys
 
 import pytest
 
-import src.media_server_manager as media_server_manager
 from src.media_server_manager import LibraryDB
 
-sys.modules.setdefault("media_server_manager", media_server_manager)
 
 from src.workflows.library_dedup.runner import (
     AudioCandidate,
