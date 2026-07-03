@@ -359,7 +359,7 @@ def scan_library(library_root: Path, extensions: set[str]) -> list[Path]:
             path = Path(root) / name
             if path.suffix.lower() in extensions:
                 files.append(path)
-    return files
+    return sorted(files)
 
 
 def resolve_collision(destination: Path, planned_destinations: set[Path]) -> Path:

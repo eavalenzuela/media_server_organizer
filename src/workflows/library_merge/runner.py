@@ -65,12 +65,14 @@ class LibraryMergeWorkflow:
 
         for source in scan_library(source_root, extensions):
             destination = destination_root / source.relative_to(source_root)
-            destination, collision = resolve_collision(destination, planned_destinations)
 
             if destination == source:
+                # Already merged; check before collision resolution so the
+                # file does not collide with itself and get a "(1)" rename.
                 skipped.append(source)
                 continue
 
+            destination, collision = resolve_collision(destination, planned_destinations)
             planned_destinations.add(destination)
             moves.append(MoveAction(source=source, destination=destination, collision=collision))
 

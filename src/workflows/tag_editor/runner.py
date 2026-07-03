@@ -156,10 +156,20 @@ class TagEditorWorkflow:
         for result in results:
             if result.get("status") != "updated":
                 continue
+            if result["destination"] != result["source"]:
+                # Undo the rename first so the restore below targets the original path.
+                rollback_entries.append(
+                    {
+                        "source": result["source"],
+                        "destination": result["destination"],
+                        "status": "moved",
+                    }
+                )
+            # Restore the pristine pre-edit copy (original tags) over the original path.
             rollback_entries.append(
                 {
                     "source": result["source"],
-                    "destination": result["destination"],
+                    "destination": result["backup"],
                     "status": "moved",
                 }
             )

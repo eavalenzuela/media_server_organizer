@@ -3,3 +3,5 @@ pydub
 simpleaudio
 sounddevice
 numpy
+# Optional: enables event-based watch mode instead of polling.
+watchdog

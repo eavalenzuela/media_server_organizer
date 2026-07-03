@@ -1,4 +1,5 @@
 import argparse
+import csv
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -16,18 +17,32 @@ import traceback
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
-from typing import TYPE_CHECKING
+
+# Allow script-style execution (`python src/media_server_manager.py`) by making the
+# repository root importable so the `src.` package imports below resolve.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from pydub import AudioSegment
 from src.workflows.tag_editor.runner import TagEditorWorkflow, TagUpdate
 
+
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        # find_spec raises ModuleNotFoundError (an ImportError) when a parent
+        # package is missing, e.g. probing "watchdog.events" without watchdog.
+        return False
+
+
 WATCHDOG_AVAILABLE = (
-    importlib.util.find_spec("watchdog.events") is not None
-    and importlib.util.find_spec("watchdog.observers") is not None
+    _module_available("watchdog.events") and _module_available("watchdog.observers")
 )
 if WATCHDOG_AVAILABLE:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -37,8 +52,10 @@ else:
     FileSystemEventHandler = object
     Observer = object
 
-if TYPE_CHECKING:
+try:
     import simpleaudio
+except ImportError:
+    simpleaudio = None
 
 
 DB_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".media_server_organizer.db")
@@ -139,6 +156,19 @@ def resolve_audio_backend(requested_backend: str, emit_message: Callable[[str], 
             "Install 'simpleaudio' or install both 'sounddevice' and 'numpy'."
         )
     return selected
+
+
+def available_workflow_names() -> list[str]:
+    workflows_dir = Path(__file__).resolve().parent / "workflows"
+    if not workflows_dir.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in workflows_dir.iterdir()
+        if path.is_dir()
+        and not path.name.startswith((".", "_"))
+        and (path / "runner.py").is_file()
+    )
 
 
 def load_workflow_runner(workflow_name: str) -> object | None:
@@ -609,7 +639,7 @@ class LibraryDB:
         kept: bool = True,
         auto_commit: bool = True,
     ) -> AudioSignature:
-        updated_at = datetime.utcnow().isoformat(timespec="seconds")
+        updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         cursor = self.connection.cursor()
         cursor.execute(
             """
@@ -703,36 +733,32 @@ class LibraryDB:
         logger.info("Indexing library items for '%s' at %s", library.name, library.path)
         self.clear_library_items(library.library_id)
         cursor = self.connection.cursor()
-        records_inserted = 0
+        rows: list[tuple[int, str, str, str]] = []
         for root, dirs, files in os.walk(library.path):
             for folder_name in dirs:
-                if records_inserted >= max_records:
+                if len(rows) >= max_records:
                     break
-                full_path = os.path.join(root, folder_name)
-                cursor.execute(
-                    """
-                    INSERT INTO library_items (library_id, path, name, entry_type)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (library.library_id, full_path, folder_name, "Folder"),
+                rows.append(
+                    (library.library_id, os.path.join(root, folder_name), folder_name, "Folder")
                 )
-                records_inserted += 1
-            if records_inserted >= max_records:
+            if len(rows) >= max_records:
                 break
             for file_name in files:
-                if records_inserted >= max_records:
+                if len(rows) >= max_records:
                     break
-                full_path = os.path.join(root, file_name)
-                cursor.execute(
-                    """
-                    INSERT INTO library_items (library_id, path, name, entry_type)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (library.library_id, full_path, file_name, "File"),
+                rows.append(
+                    (library.library_id, os.path.join(root, file_name), file_name, "File")
                 )
-                records_inserted += 1
-            if records_inserted >= max_records:
+            if len(rows) >= max_records:
                 break
+        cursor.executemany(
+            """
+            INSERT INTO library_items (library_id, path, name, entry_type)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+        records_inserted = len(rows)
         self.connection.commit()
         logger.info(
             "Indexed %s records for library '%s'%s",
@@ -743,12 +769,15 @@ class LibraryDB:
 
     def search_items(self, term: str, limit: int = 200) -> list[tuple[int, str, str, str]]:
         cursor = self.connection.cursor()
-        like_term = f"%{term.lower()}%"
+        escaped_term = (
+            term.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        like_term = f"%{escaped_term}%"
         cursor.execute(
             """
             SELECT library_id, path, name, entry_type
             FROM library_items
-            WHERE lower(name) LIKE ? OR lower(path) LIKE ?
+            WHERE lower(name) LIKE ? ESCAPE '\\' OR lower(path) LIKE ? ESCAPE '\\'
             ORDER BY name
             LIMIT ?
             """,
@@ -756,6 +785,19 @@ class LibraryDB:
         )
         logger.debug("Search query for term '%s' with limit %s", term, limit)
         return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
+
+    def fetch_library_items(self, library_id: int) -> list[tuple[str, str, str]]:
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            SELECT path, name, entry_type
+            FROM library_items
+            WHERE library_id = ?
+            ORDER BY path
+            """,
+            (library_id,),
+        )
+        return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
 
     def fetch_libraries(self) -> list[Library]:
         cursor = self.connection.cursor()
@@ -829,6 +871,11 @@ class LibraryDB:
 
     def delete_library(self, library_id: int) -> None:
         cursor = self.connection.cursor()
+        cursor.execute("DELETE FROM library_items WHERE library_id = ?", (library_id,))
+        cursor.execute(
+            "UPDATE audio_signatures SET library_id = NULL WHERE library_id = ?",
+            (library_id,),
+        )
         cursor.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
         self.connection.commit()
 
@@ -1240,6 +1287,7 @@ class ThemeEditorDialog(tk.Toplevel):
         master: tk.Tk,
         themes: dict[str, dict[str, str]],
         apply_theme_callback: Callable[[dict[str, str]], None] | None = None,
+        save_theme_callback: Callable[[str, dict[str, str]], Path] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Theme Editor")
@@ -1251,6 +1299,7 @@ class ThemeEditorDialog(tk.Toplevel):
         self.selected_theme_name = tk.StringVar(value=self.theme_names[0])
         self.selected_component: str | None = None
         self.apply_theme_callback = apply_theme_callback
+        self.save_theme_callback = save_theme_callback
 
         self.current_color = tk.StringVar(value="#3b74ff")
         self.hex_entry = tk.StringVar()
@@ -1479,7 +1528,20 @@ class ThemeEditorDialog(tk.Toplevel):
         theme_name = self.selected_theme_name.get()
         if not theme_name:
             return
-        messagebox.showinfo("Theme Editor", f"Theme '{theme_name}' saved.")
+        theme = self.themes.get(theme_name, {})
+        if self.save_theme_callback:
+            try:
+                saved_path = self.save_theme_callback(theme_name, theme)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Theme Editor", f"Unable to save theme: {exc}", parent=self
+                )
+                return
+            messagebox.showinfo(
+                "Theme Editor", f"Theme '{theme_name}' saved to:\n{saved_path}", parent=self
+            )
+            return
+        messagebox.showinfo("Theme Editor", f"Theme '{theme_name}' saved.", parent=self)
 
     def _apply_theme(self) -> None:
         theme_name = self.selected_theme_name.get()
@@ -1553,12 +1615,7 @@ class WorkflowsDialog(tk.Toplevel):
         self.focus_set()
 
     def _load_workflows(self) -> list[str]:
-        workflows_dir = Path(__file__).resolve().parent / "workflows"
-        if not workflows_dir.is_dir():
-            return []
-        return sorted(
-            path.name for path in workflows_dir.iterdir() if path.is_dir() and not path.name.startswith(".")
-        )
+        return available_workflow_names()
 
     def _populate_workflows(self) -> None:
         self.workflow_list.delete(0, tk.END)
@@ -2058,7 +2115,7 @@ class MediaServerApp:
             label="Library Management", command=self._open_library_management_dialog
         )
         options_menu.add_command(label="Theme", command=self._open_theme_dialog)
-        options_menu.add_command(label="Export", command=lambda: self._show_placeholder("Export"))
+        options_menu.add_command(label="Export", command=self._export_library_index)
         menu.add_cascade(label="Options", menu=options_menu)
 
         help_menu = tk.Menu(menu, tearoff=0)
@@ -2313,6 +2370,10 @@ class MediaServerApp:
         self.playlist_listbox.grid(row=0, column=0, sticky="nsew")
         playlist_scroll.grid(row=0, column=1, sticky="ns")
         self.playlist_listbox.bind("<<ListboxSelect>>", self._on_playlist_selected)
+        self.playlist_listbox.bind("<Button-3>", self._show_playlist_menu)
+        self.playlist_menu = tk.Menu(self.playlist_listbox, tearoff=0)
+        self.playlist_menu.add_command(label="Rename...", command=self._rename_selected_playlist)
+        self.playlist_menu.add_command(label="Delete", command=self._delete_selected_playlist)
 
         items_container = ttk.Labelframe(self.playlist_frame, text="Playlist Items", padding=6)
         items_container.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
@@ -2399,6 +2460,53 @@ class MediaServerApp:
         if 0 <= index < len(names):
             self.current_playlist_name.set(names[index])
         self._refresh_playlist_items()
+
+    def _show_playlist_menu(self, event: tk.Event) -> None:
+        if not self.playlist_listbox:
+            return
+        index = self.playlist_listbox.nearest(event.y)
+        if index < 0 or index >= self.playlist_listbox.size():
+            return
+        self.playlist_listbox.selection_clear(0, tk.END)
+        self.playlist_listbox.selection_set(index)
+        self._on_playlist_selected(event)
+        try:
+            self.playlist_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.playlist_menu.grab_release()
+
+    def _rename_selected_playlist(self) -> None:
+        name = self.current_playlist_name.get()
+        if not name:
+            return
+        new_name = simpledialog.askstring(
+            "Rename Playlist", "New playlist name:", initialvalue=name, parent=self.root
+        )
+        if not new_name or new_name == name:
+            return
+        try:
+            renamed = self.playlist_manager.rename_playlist(name, new_name)
+        except ValueError as exc:
+            messagebox.showerror("Rename Playlist", str(exc))
+            return
+        self.current_playlist_name.set(renamed)
+        self._refresh_playlist_list()
+        self._update_playlist_menus()
+
+    def _delete_selected_playlist(self) -> None:
+        name = self.current_playlist_name.get()
+        if not name:
+            return
+        if not messagebox.askyesno(
+            "Delete Playlist",
+            f"Delete playlist '{name}'? The media files themselves are not removed.",
+            parent=self.root,
+        ):
+            return
+        self.playlist_manager.delete_playlist(name)
+        self.current_playlist_name.set("")
+        self._refresh_playlist_list()
+        self._update_playlist_menus()
 
     def _refresh_playlist_items(self) -> None:
         if not self.playlist_items:
@@ -2717,6 +2825,11 @@ class MediaServerApp:
             logger.exception("Unable to list directory for library '%s' at %s", library.name, path)
             return
 
+        root_path = os.path.abspath(library.path)
+        current_path = os.path.abspath(path)
+        if current_path != root_path and current_path.startswith(f"{root_path}{os.sep}"):
+            tree.insert("", "end", values=("Up", os.path.dirname(current_path)))
+
         for entry in entries:
             full_path = os.path.join(path, entry)
             entry_type = "Folder" if os.path.isdir(full_path) else "File"
@@ -2940,7 +3053,7 @@ class MediaServerApp:
             return
         item = tree.item(selection[0])
         entry_type, location = item["values"]
-        if entry_type == "Folder" and os.path.isdir(location):
+        if entry_type in ("Folder", "Up") and os.path.isdir(location):
             self._navigate_to_path(location)
         elif entry_type == "File" and os.path.isfile(location):
             self._handle_media_activation(location)
@@ -3276,12 +3389,10 @@ class MediaServerApp:
         return self._play_with_simpleaudio(segment)
 
     def _play_with_simpleaudio(self, segment: AudioSegment) -> object:
-        try:
-            import simpleaudio
-        except ImportError as exc:
+        if simpleaudio is None:
             raise RuntimeError(
                 "simpleaudio is not installed. Install it or choose the sounddevice backend."
-            ) from exc
+            )
         return simpleaudio.play_buffer(
             segment.raw_data,
             num_channels=segment.channels,
@@ -3478,17 +3589,44 @@ class MediaServerApp:
             self.audio_player_frame.grid_remove()
 
     def _open_theme_dialog(self) -> None:
-        ThemeEditorDialog(self.root, self.themes, self._apply_theme)
+        ThemeEditorDialog(
+            self.root,
+            self.themes,
+            apply_theme_callback=self._apply_theme,
+            save_theme_callback=self._save_theme_preset,
+        )
+
+    def _save_theme_preset(self, name: str, theme: dict[str, str]) -> Path:
+        themes_dir = Path(__file__).resolve().parent / "themes"
+        themes_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = re.sub(r"[^\w\-]+", "_", name.strip().lower()).strip("_") or "theme"
+        theme_path = themes_dir / f"{safe_stem}.json"
+        theme_path.write_text(json.dumps(theme, indent=2) + "\n", encoding="utf-8")
+        self.themes[name] = dict(theme)
+        logger.info("Saved theme '%s' to %s", name, theme_path)
+        return theme_path
+
+    def _resolve_color(self, color: str, fallback: str) -> str:
+        try:
+            self.root.winfo_rgb(color)
+        except tk.TclError:
+            # Windows-only names like "SystemButtonFace" are not valid on
+            # other platforms; fall back so themes stay cross-platform.
+            return fallback
+        return color
 
     def _apply_theme(self, theme: dict[str, str]) -> None:
         self.current_theme = dict(theme)
-        window_bg = theme.get("window_background", self.root.cget("bg"))
-        sidebar_bg = theme.get("sidebar_background", window_bg)
-        toolbar_bg = theme.get("toolbar_background", window_bg)
-        tree_bg = theme.get("treeview_background", "white")
-        metadata_bg = theme.get("metadata_background", window_bg)
-        accent = theme.get("accent_color", "#3b74ff")
-        text_color = theme.get("text_color", "black")
+        default_bg = self.root.cget("bg")
+        window_bg = self._resolve_color(
+            theme.get("window_background", default_bg), default_bg
+        )
+        sidebar_bg = self._resolve_color(theme.get("sidebar_background", window_bg), window_bg)
+        toolbar_bg = self._resolve_color(theme.get("toolbar_background", window_bg), window_bg)
+        tree_bg = self._resolve_color(theme.get("treeview_background", "white"), "white")
+        metadata_bg = self._resolve_color(theme.get("metadata_background", window_bg), window_bg)
+        accent = self._resolve_color(theme.get("accent_color", "#3b74ff"), "#3b74ff")
+        text_color = self._resolve_color(theme.get("text_color", "black"), "black")
 
         self.root.configure(background=window_bg)
         self.style.configure("TFrame", background=window_bg)
@@ -3541,6 +3679,53 @@ class MediaServerApp:
 
     def _show_placeholder(self, title: str) -> None:
         messagebox.showinfo(title, f"{title} options will be available in a future update.")
+
+    def _export_library_index(self) -> None:
+        if not self.current_library:
+            messagebox.showinfo("Export", "Select a library to export.")
+            return
+        library = self.current_library
+        self._refresh_search_index(force=False)
+        items = self.db.fetch_library_items(library.library_id)
+        if not items:
+            messagebox.showinfo("Export", f"No indexed items found for '{library.name}'.")
+            return
+        file_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export Library Index",
+            defaultextension=".csv",
+            initialfile=f"{library.name}_index",
+            filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json")],
+        )
+        if not file_path:
+            return
+        try:
+            if file_path.lower().endswith(".json"):
+                payload = {
+                    "library": library.name,
+                    "library_path": library.path,
+                    "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "items": [
+                        {"path": path, "name": name, "type": entry_type}
+                        for path, name, entry_type in items
+                    ],
+                }
+                Path(file_path).write_text(
+                    json.dumps(payload, indent=2), encoding="utf-8"
+                )
+            else:
+                with open(file_path, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["path", "name", "type"])
+                    writer.writerows(items)
+        except OSError as exc:
+            logger.exception("Export failed for library '%s'", library.name)
+            messagebox.showerror("Export", f"Unable to write export file: {exc}")
+            return
+        logger.info("Exported %s items for library '%s' to %s", len(items), library.name, file_path)
+        messagebox.showinfo(
+            "Export", f"Exported {len(items)} items from '{library.name}' to:\n{file_path}"
+        )
 
     def _show_about(self) -> None:
         messagebox.showinfo(
@@ -3794,19 +3979,66 @@ class MediaServerApp:
             formatted[f"Tag ({key})"] = str(value)
         return formatted
 
-    def _edit_metadata_value(self, event: tk.Event) -> None:
-        label_widget = event.widget
-        field_name = next(
-            (key for key, label in self.metadata_labels.items() if label == label_widget), None
-        )
-        if not field_name:
+def headless_list_libraries(db_path: str) -> None:
+    db = LibraryDB(db_path)
+    try:
+        libraries = db.fetch_libraries()
+        if not libraries:
+            print("No libraries configured.")
             return
-        current_value = label_widget.cget("text")
-        new_value = simpledialog.askstring(
-            "Edit Metadata", f"Update {field_name}:", initialvalue=current_value, parent=self.root
-        )
-        if new_value is not None:
-            label_widget.config(text=new_value)
+        for library in libraries:
+            location = library.path
+            if library.library_type == "remote":
+                location = f"{library.username or 'user'}@{library.host}:{library.path}"
+            print(f"[{library.library_id}] {library.name} ({library.library_type}): {location}")
+    finally:
+        db.close()
+
+
+def headless_run_workflow(workflow_name: str, options_file: str | None, action: str) -> int:
+    runner = load_workflow_runner(workflow_name)
+    if runner is None:
+        names = ", ".join(available_workflow_names()) or "none found"
+        print(f"Unable to load workflow '{workflow_name}'. Available workflows: {names}")
+        return 1
+
+    options = {option.key: option.value for option in getattr(runner, "option_definitions")()}
+    if options_file:
+        try:
+            overrides = json.loads(Path(options_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Unable to read workflow options file: {exc}")
+            return 1
+        if not isinstance(overrides, dict):
+            print("Workflow options file must contain a JSON object of option overrides.")
+            return 1
+        options.update({str(key): str(value) for key, value in overrides.items()})
+
+    try:
+        plan = getattr(runner, "build_plan")(options)
+        preview_items = getattr(runner, "preview_items")(plan)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Unable to build workflow plan: {exc}")
+        return 1
+
+    print(f"Workflow: {workflow_name}")
+    for label, value in preview_items:
+        print(f"  {label}: {value}")
+    if action == "plan":
+        print("Plan only; re-run with --workflow-action apply to make changes.")
+        return 0
+
+    try:
+        result = getattr(runner, "apply")(options, plan)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Workflow apply failed: {exc}")
+        return 1
+    for label, value in getattr(result, "summary_items", []):
+        print(f"  {label}: {value}")
+    rollback_script = getattr(result, "rollback_script", None)
+    if rollback_script:
+        print(f"Rollback script: {rollback_script}")
+    return 0
 
 
 def run() -> None:
@@ -3824,6 +4056,27 @@ def run() -> None:
         default="simpleaudio",
         help="Choose the playback backend for audio files.",
     )
+    parser.add_argument(
+        "--list-libraries",
+        action="store_true",
+        help="List configured libraries and exit (implies --nogui).",
+    )
+    parser.add_argument(
+        "--run-workflow",
+        metavar="NAME",
+        help="Run a workflow headlessly and exit (implies --nogui).",
+    )
+    parser.add_argument(
+        "--workflow-options",
+        metavar="FILE",
+        help="JSON file with option overrides for --run-workflow.",
+    )
+    parser.add_argument(
+        "--workflow-action",
+        choices=["plan", "apply"],
+        default="plan",
+        help="Whether --run-workflow previews the plan or applies it (default: plan).",
+    )
     args = parser.parse_args()
 
     startup_messages: list[str] = []
@@ -3839,10 +4092,26 @@ def run() -> None:
         logger.warning(message)
     logger.info("Audio backend: %s", resolved_audio_backend)
 
+    if args.list_libraries or args.run_workflow:
+        logger.info("Running headless command; GUI disabled")
+        exit_code = 0
+        if args.list_libraries:
+            headless_list_libraries(args.db)
+        if args.run_workflow:
+            exit_code = headless_run_workflow(
+                args.run_workflow, args.workflow_options, args.workflow_action
+            )
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     if args.nogui:
         for message in startup_messages:
             print(f"Audio backend warning: {message}")
-        print("GUI disabled. Provide --db to change database location.")
+        print(
+            "GUI disabled. Use --list-libraries or --run-workflow NAME to work headlessly; "
+            "provide --db to change database location."
+        )
         logger.info("Running in CLI-only mode; GUI disabled")
         return
 

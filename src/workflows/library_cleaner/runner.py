@@ -88,12 +88,14 @@ class LibraryCleanerWorkflow:
             tag_info = extract_tags(source, use_ffprobe)
             destination = destination_root / render_template(template, tag_info)
             destination = destination.with_suffix(source.suffix)
-            destination, collision = resolve_collision(destination, planned_destinations)
 
             if destination == source:
+                # Already organized; check before collision resolution so the
+                # file does not collide with itself and get a "(1)" rename.
                 skipped.append(source)
                 continue
 
+            destination, collision = resolve_collision(destination, planned_destinations)
             planned_destinations.add(destination)
             moves.append(MoveAction(source=source, destination=destination, collision=collision, tag_info=tag_info))
 
