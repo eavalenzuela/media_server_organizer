@@ -9,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".alac"}
+# Keep in sync with the canonical audio set (library_cleaner.SUPPORTED_EXTENSIONS
+# and AUDIO_EXTENSIONS in media_server_manager) so every surface agrees.
+SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".alac", ".opus"}
 
 
 @dataclass(frozen=True)
@@ -108,7 +110,9 @@ class LibraryMergeWorkflow:
     def apply(self, options: dict[str, str], plan: WorkflowPlan) -> WorkflowResult:
         resolved = normalize_options(options)
         log_dir = ensure_log_dir(plan.destination_root)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution keeps rapid successive applies from deriving the
+        # same filenames and overwriting each other's rollback script and log.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         log_path = log_dir / f"library_merge_{timestamp}.json"
         rollback_path = log_dir / f"library_merge_{timestamp}_rollback.sh"
         rollback_ps_path = log_dir / f"library_merge_{timestamp}_rollback.ps1"
@@ -260,6 +264,16 @@ def ensure_log_dir(destination_root: Path) -> Path:
     return log_dir
 
 
+def sh_quote(value: str) -> str:
+    """Quote a string as a single literal POSIX sh word (no substitution)."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def ps_quote(value: str) -> str:
+    """Quote a string as a single literal PowerShell string (no substitution)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) -> None:
     lines = ["#!/usr/bin/env sh", "set -eu", ""]
     for entry in results:
@@ -267,9 +281,9 @@ def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) ->
             continue
         source = entry["source"]
         destination = entry["destination"]
-        lines.append(f"if [ -e {json.dumps(destination)} ]; then")
-        lines.append(f"  mkdir -p {json.dumps(os.path.dirname(source))}")
-        lines.append(f"  mv {json.dumps(destination)} {json.dumps(source)}")
+        lines.append(f"if [ -e {sh_quote(destination)} ]; then")
+        lines.append(f"  mkdir -p {sh_quote(os.path.dirname(source))}")
+        lines.append(f"  mv {sh_quote(destination)} {sh_quote(source)}")
         lines.append("fi")
     rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     rollback_path.chmod(0o755)
@@ -284,10 +298,10 @@ def write_rollback_powershell_script(
             continue
         source = entry["source"]
         destination = entry["destination"]
-        lines.append(f"if (Test-Path -LiteralPath {json.dumps(destination)}) {{")
-        lines.append(f"  New-Item -ItemType Directory -Path {json.dumps(os.path.dirname(source))} -Force | Out-Null")
+        lines.append(f"if (Test-Path -LiteralPath {ps_quote(destination)}) {{")
+        lines.append(f"  New-Item -ItemType Directory -Path {ps_quote(os.path.dirname(source))} -Force | Out-Null")
         lines.append(
-            f"  Move-Item -LiteralPath {json.dumps(destination)} -Destination {json.dumps(source)} -Force"
+            f"  Move-Item -LiteralPath {ps_quote(destination)} -Destination {ps_quote(source)} -Force"
         )
         lines.append("}")
     rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

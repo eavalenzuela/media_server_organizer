@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 from src.workflows.library_cleaner.runner import (
@@ -8,6 +9,7 @@ from src.workflows.library_cleaner.runner import (
     parse_track_number,
     render_template,
     resolve_collision,
+    write_rollback_script,
 )
 
 
@@ -109,3 +111,25 @@ def test_apply_moves_files_and_writes_rollback_scripts(tmp_path):
     content = result.rollback_script.read_text(encoding="utf-8")
     assert str(destination) in content
     assert str(loose) in content
+
+
+def test_rollback_script_does_not_execute_embedded_shell_command(tmp_path):
+    # A file whose name contains a shell command substitution must be restored
+    # literally; the rollback script must never evaluate $(...) (was CVE-worthy
+    # command injection when paths were interpolated with json.dumps).
+    proof = "PWNED"
+    dest = tmp_path / f"song $(touch {proof}).mp3"
+    dest.write_bytes(b"audio")
+    restored = tmp_path / "restored.mp3"
+
+    script = tmp_path / "rollback.sh"
+    write_rollback_script(
+        script,
+        [{"source": str(restored), "destination": str(dest), "status": "moved"}],
+    )
+
+    subprocess.run(["/bin/sh", str(script)], check=True, cwd=tmp_path)
+
+    assert not (tmp_path / proof).exists()  # injected command must not have run
+    assert restored.exists()  # the literal file was restored
+    assert not dest.exists()

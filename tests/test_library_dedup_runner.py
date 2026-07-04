@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -14,6 +13,10 @@ from src.workflows.library_dedup.runner import (
     LibraryDedupWorkflow,
     apply_action,
     fallback_audio_quality,
+    ps_quote,
+    scan_library,
+    select_best_candidate,
+    sh_quote,
     write_rollback_powershell_script,
     write_rollback_script,
 )
@@ -202,7 +205,7 @@ def test_write_rollback_script_contains_quarantine_reversal(tmp_path):
     )
 
     content = rollback_script.read_text(encoding="utf-8")
-    assert f"mv {json.dumps(str(destination))} {json.dumps(str(source))}" in content
+    assert f"mv {sh_quote(str(destination))} {sh_quote(str(source))}" in content
 
 
 def test_build_plan_creates_delete_backup_actions(tmp_path, monkeypatch):
@@ -256,11 +259,31 @@ def test_rollback_scripts_restore_moved_delete_entries(tmp_path):
     sh_content = rollback_sh.read_text(encoding="utf-8")
     ps_content = rollback_ps1.read_text(encoding="utf-8")
 
-    assert f"mv {json.dumps(str(destination))} {json.dumps(str(source))}" in sh_content
+    assert f"mv {sh_quote(str(destination))} {sh_quote(str(source))}" in sh_content
     assert (
-        f"Move-Item -LiteralPath {json.dumps(str(destination))} -Destination {json.dumps(str(source))} -Force"
+        f"Move-Item -LiteralPath {ps_quote(str(destination))} -Destination {ps_quote(str(source))} -Force"
         in ps_content
     )
+
+
+def test_scan_library_skips_state_directory(tmp_path):
+    (tmp_path / "song.mp3").write_bytes(b"a")
+    backup_dir = tmp_path / ".library_dedup" / "delete_backup"
+    backup_dir.mkdir(parents=True)
+    # A backup copy left behind by a previous run must not be re-discovered.
+    (backup_dir / "song.mp3").write_bytes(b"a")
+
+    assert scan_library(tmp_path, {".mp3"}) == [tmp_path / "song.mp3"]
+
+
+def test_select_best_candidate_never_prefers_state_dir_copy(tmp_path):
+    live = _candidate(tmp_path / "A.mp3", "sig", 128000)
+    backup = _candidate(tmp_path / ".library_dedup" / "delete_backup" / "A.mp3", "sig", 128000)
+
+    # Regardless of ordering, a live file must outrank its own backup so the
+    # original is never displaced into the backup tree on a subsequent run.
+    assert select_best_candidate([backup, live]).path == live.path
+    assert select_best_candidate([live, backup]).path == live.path
 
 
 def test_fallback_audio_quality_accounts_for_channel_count(tmp_path, monkeypatch):

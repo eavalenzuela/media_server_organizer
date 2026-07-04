@@ -1,6 +1,6 @@
-import json
 from pathlib import Path
 
+from src.workflows.library_cleaner.runner import sh_quote
 from src.workflows.tag_editor.runner import (
     TagEditorWorkflow,
     TagUpdate,
@@ -91,6 +91,6 @@ def test_apply_rollback_restores_original_content_from_backup(tmp_path, monkeypa
 
     assert result.rollback_script is not None
     script = result.rollback_script.read_text(encoding="utf-8")
-    assert f"mv {json.dumps(str(backup))} {json.dumps(str(audio))}" in script
+    assert f"mv {sh_quote(str(backup))} {sh_quote(str(audio))}" in script
     # In-place edits must not generate broken self-move (mv X X) entries.
-    assert f"mv {json.dumps(str(audio))} {json.dumps(str(audio))}" not in script
+    assert f"mv {sh_quote(str(audio))} {sh_quote(str(audio))}" not in script

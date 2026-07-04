@@ -29,7 +29,13 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from pydub import AudioSegment
+from src.workflows.library_cleaner.runner import SUPPORTED_EXTENSIONS as _AUDIO_EXTENSIONS
 from src.workflows.tag_editor.runner import TagEditorWorkflow, TagUpdate
+
+# Canonical audio-extension set, shared with every workflow (whose
+# SUPPORTED_EXTENSIONS mirror it) so a file is handled the same way on every
+# surface: GUI playback/tag editing and the cleaner/dedup/merge/tag workflows.
+AUDIO_EXTENSIONS = frozenset(_AUDIO_EXTENSIONS)
 
 
 def _module_available(module_name: str) -> bool:
@@ -343,9 +349,14 @@ class PollingLibraryWatcher:
     def _run_loop(self) -> None:
         while self._running.is_set():
             scan_started = time.monotonic()
-            created_or_renamed = self._scan_paths(force_full=False)
-            if created_or_renamed:
-                self.on_paths_detected(created_or_renamed)
+            try:
+                created_or_renamed = self._scan_paths(force_full=False)
+                if created_or_renamed:
+                    self.on_paths_detected(created_or_renamed)
+            except Exception:
+                # Never let an unexpected error silently kill the poll thread and
+                # with it new-file detection; log and keep polling.
+                logger.exception("Library watch poll cycle failed; continuing")
             elapsed = time.monotonic() - scan_started
             effective_interval = max(self.interval_seconds, self.max_scan_interval_seconds)
             wait_seconds = max(0.0, effective_interval - elapsed)
@@ -2049,7 +2060,7 @@ class MediaServerApp:
         self.watch_enabled_var = tk.BooleanVar(value=False)
         self.watch_debounce_var = tk.StringVar(value="2.0")
         self.watch_poll_max_hz_var = tk.StringVar(value="1.0")
-        self.watch_extensions_var = tk.StringVar(value=".mp3,.flac,.m4a,.aac,.ogg,.wav,.alac")
+        self.watch_extensions_var = tk.StringVar(value=",".join(sorted(AUDIO_EXTENSIONS)))
         self.watch_status_var = tk.StringVar(value="Watch mode disabled.")
         self.indexed_libraries: set[int] = set()
         self.watch_history: list[WatchRunHistoryEntry] = []
@@ -2059,6 +2070,12 @@ class MediaServerApp:
             extensions=self._parse_watch_extensions(),
         )
         self.watch_processor_job: str | None = None
+        # The polling watcher runs on a background thread and must not touch the
+        # main-thread SQLite connection (sqlite3 forbids cross-thread use). It
+        # reads library roots through this cache, which is refreshed only on the
+        # main thread (watch start + each _process_watch_queue tick).
+        self._watch_roots_lock = threading.Lock()
+        self._watch_roots_cache: list[str] = []
         self.library_watcher = PollingLibraryWatcher(
             get_library_roots=self._watch_library_roots,
             on_paths_detected=self._enqueue_watch_paths,
@@ -2625,7 +2642,23 @@ class MediaServerApp:
         return {value if value.startswith(".") else f".{value}" for value in values}
 
     def _watch_library_roots(self) -> list[str]:
-        return [library.path for library in self.db.fetch_libraries() if library.path]
+        # Called from the watcher thread; return the main-thread-populated cache
+        # instead of querying SQLite (which raises across threads).
+        lock = getattr(self, "_watch_roots_lock", None)
+        if lock is None:
+            return list(getattr(self, "_watch_roots_cache", []))
+        with lock:
+            return list(self._watch_roots_cache)
+
+    def _refresh_watch_roots_cache(self) -> None:
+        # Must run on the main thread (owns the SQLite connection).
+        db = getattr(self, "db", None)
+        lock = getattr(self, "_watch_roots_lock", None)
+        if db is None or lock is None:
+            return
+        roots = [library.path for library in db.fetch_libraries() if library.path]
+        with lock:
+            self._watch_roots_cache = roots
 
     def _apply_watch_settings(self) -> None:
         debounce_seconds = self._parse_debounce_seconds()
@@ -2641,6 +2674,9 @@ class MediaServerApp:
     def _toggle_watch_mode(self) -> None:
         if self.watch_enabled_var.get():
             self._apply_watch_settings()
+            # Populate the roots cache on the main thread before the watcher's
+            # first (main-thread) scan and its background polling read it.
+            self._refresh_watch_roots_cache()
             self.library_watcher.start()
             self._ensure_watch_processor()
             self._set_watch_status("Watch mode running.")
@@ -2675,18 +2711,49 @@ class MediaServerApp:
 
     def _process_watch_queue(self) -> None:
         self.watch_processor_job = None
+        # Keep the watcher thread's roots cache current (added/removed libraries)
+        # from the main thread, which owns the SQLite connection.
+        self._refresh_watch_roots_cache()
         for path in self.watch_task_queue.pop_ready():
             self._run_watch_workflows_for_path(path)
         if self.watch_enabled_var.get():
             self.watch_processor_job = self.root.after(500, self._process_watch_queue)
 
+    def _library_root_for_path(self, path: str) -> str | None:
+        try:
+            target = Path(path).resolve()
+        except OSError:
+            target = Path(path)
+        best: str | None = None
+        for root in self._watch_library_roots():
+            if not root:
+                continue
+            try:
+                root_resolved = Path(root).resolve()
+            except OSError:
+                continue
+            if target == root_resolved or root_resolved in target.parents:
+                root_str = str(root_resolved)
+                # Prefer the deepest (most specific) matching library root.
+                if best is None or len(root_str) > len(best):
+                    best = root_str
+        return best
+
     def _run_watch_workflows_for_path(self, path: str) -> None:
+        parent = str(Path(path).parent)
+        # Organize newly detected files within the library they belong to. The
+        # cleaner's destination_root default is ~/Music, so without this a file
+        # dropped into any watched library would be silently relocated out of it.
+        destination_root = self._library_root_for_path(path) or parent
         for workflow_name in ("library_cleaner", "library_dedup"):
             runner = load_workflow_runner(workflow_name)
             if not runner:
                 self._append_watch_history("error", f"{workflow_name}: runner unavailable for {path}", "-")
                 continue
-            options: dict[str, str] = {"library_path": str(Path(path).parent)}
+            options: dict[str, str] = {
+                "library_path": parent,
+                "destination_root": destination_root,
+            }
             for option in getattr(runner, "option_definitions")():
                 options.setdefault(option.key, option.value)
             try:
@@ -3813,7 +3880,7 @@ class MediaServerApp:
 
     @staticmethod
     def _audio_extensions() -> set[str]:
-        return {".mp3", ".flac", ".aac", ".m4a", ".wav", ".ogg", ".opus"}
+        return set(AUDIO_EXTENSIONS)
 
     @staticmethod
     def _video_extensions() -> set[str]:

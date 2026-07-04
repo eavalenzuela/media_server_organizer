@@ -15,7 +15,15 @@ try:
 except ModuleNotFoundError:  # Script-style execution fallback.
     from media_server_manager import DB_DEFAULT_PATH, LibraryDB
 
-SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".alac"}
+# Keep in sync with the canonical audio set (library_cleaner.SUPPORTED_EXTENSIONS
+# and AUDIO_EXTENSIONS in media_server_manager) so every surface agrees.
+SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".wav", ".alac", ".opus"}
+
+# Name of the workflow's own state directory (quarantine + delete backups live
+# under it). It must be excluded from scans so previously quarantined/soft-deleted
+# copies — which are byte-identical to the retained originals — are not
+# re-discovered and re-grouped on a later run.
+STATE_DIR_NAME = ".library_dedup"
 
 
 @dataclass(frozen=True)
@@ -183,7 +191,9 @@ class LibraryDedupWorkflow:
     def apply(self, options: dict[str, str], plan: DedupPlan) -> WorkflowResult:
         resolved = normalize_options(options)
         log_dir = ensure_log_dir(plan.library_root)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution keeps rapid successive applies from deriving the
+        # same filenames and overwriting each other's rollback script and log.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         log_path = log_dir / f"library_dedup_{timestamp}.json"
         rollback_path = log_dir / f"library_dedup_{timestamp}_rollback.sh"
         rollback_ps_path = log_dir / f"library_dedup_{timestamp}_rollback.ps1"
@@ -329,11 +339,11 @@ def normalize_options(options: dict[str, str]) -> dict[str, Any]:
     quarantine_value = options.get("quarantine_folder", "").strip()
     quarantine_folder: Path | None = None
     if mode == "quarantine":
-        quarantine_folder = Path(os.path.expanduser(quarantine_value)).resolve() if quarantine_value else library_path / ".library_dedup" / "quarantine"
+        quarantine_folder = Path(os.path.expanduser(quarantine_value)).resolve() if quarantine_value else library_path / STATE_DIR_NAME / "quarantine"
 
     delete_backup_folder: Path | None = None
     if mode == "delete":
-        delete_backup_folder = library_path / ".library_dedup" / "delete_backup"
+        delete_backup_folder = library_path / STATE_DIR_NAME / "delete_backup"
 
     dry_run_value = options.get("dry_run", "false").strip().lower()
     if dry_run_value not in {"true", "false"}:
@@ -354,7 +364,12 @@ def normalize_options(options: dict[str, str]) -> dict[str, Any]:
 
 def scan_library(library_root: Path, extensions: set[str]) -> list[Path]:
     files: list[Path] = []
-    for root, _dirs, file_names in os.walk(library_root):
+    for root, dirs, file_names in os.walk(library_root):
+        # Prune the workflow's own state directory in place so quarantined and
+        # soft-deleted backups (byte-identical to the retained originals) are
+        # not re-scanned and re-grouped, which could otherwise displace a live
+        # original into the backup tree on a subsequent run.
+        dirs[:] = [name for name in dirs if name != STATE_DIR_NAME]
         for name in file_names:
             path = Path(root) / name
             if path.suffix.lower() in extensions:
@@ -401,6 +416,16 @@ def ensure_log_dir(library_root: Path) -> Path:
     return log_dir
 
 
+def sh_quote(value: str) -> str:
+    """Quote a string as a single literal POSIX sh word (no substitution)."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def ps_quote(value: str) -> str:
+    """Quote a string as a single literal PowerShell string (no substitution)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) -> None:
     lines = ["#!/usr/bin/env sh", "set -eu", ""]
     for entry in results:
@@ -410,9 +435,9 @@ def write_rollback_script(rollback_path: Path, results: list[dict[str, Any]]) ->
         destination = entry.get("destination")
         if not destination:
             continue
-        lines.append(f"if [ -e {json.dumps(destination)} ]; then")
-        lines.append(f"  mkdir -p {json.dumps(os.path.dirname(candidate))}")
-        lines.append(f"  mv {json.dumps(destination)} {json.dumps(candidate)}")
+        lines.append(f"if [ -e {sh_quote(destination)} ]; then")
+        lines.append(f"  mkdir -p {sh_quote(os.path.dirname(candidate))}")
+        lines.append(f"  mv {sh_quote(destination)} {sh_quote(candidate)}")
         lines.append("fi")
     rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     rollback_path.chmod(0o755)
@@ -429,12 +454,12 @@ def write_rollback_powershell_script(
         destination = entry.get("destination")
         if not destination:
             continue
-        lines.append(f"if (Test-Path -LiteralPath {json.dumps(destination)}) {{")
+        lines.append(f"if (Test-Path -LiteralPath {ps_quote(destination)}) {{")
         lines.append(
-            f"  New-Item -ItemType Directory -Path {json.dumps(os.path.dirname(candidate))} -Force | Out-Null"
+            f"  New-Item -ItemType Directory -Path {ps_quote(os.path.dirname(candidate))} -Force | Out-Null"
         )
         lines.append(
-            f"  Move-Item -LiteralPath {json.dumps(destination)} -Destination {json.dumps(candidate)} -Force"
+            f"  Move-Item -LiteralPath {ps_quote(destination)} -Destination {ps_quote(candidate)} -Force"
         )
         lines.append("}")
     rollback_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -520,7 +545,7 @@ def fallback_audio_quality(path: Path) -> tuple[int | None, int | None, str | No
 
 
 def select_best_candidate(candidates: list[AudioCandidate]) -> AudioCandidate:
-    def score(candidate: AudioCandidate) -> tuple[int, int, int, int]:
+    def score(candidate: AudioCandidate) -> tuple[int, int, int, int, int]:
         format_rank = {
             "flac": 3,
             "alac": 3,
@@ -530,7 +555,13 @@ def select_best_candidate(candidates: list[AudioCandidate]) -> AudioCandidate:
             "ogg": 2,
             "mp3": 1,
         }
+        # A copy living under the workflow's state directory (a quarantine or
+        # delete backup) must never outrank a live file, otherwise a later run
+        # could pick the backup as "best" and displace the real original into
+        # the backup tree. Live files score 1 here, backups 0.
+        not_backup = 0 if STATE_DIR_NAME in candidate.path.parts else 1
         return (
+            not_backup,
             candidate.bitrate or 0,
             candidate.sample_rate or 0,
             format_rank.get((candidate.format_name or "").lower(), 0),

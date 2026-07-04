@@ -106,7 +106,9 @@ class TagEditorWorkflow:
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             raise RuntimeError("ffmpeg and ffprobe are required for bulk tag editing.")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution keeps rapid successive applies from deriving the
+        # same filenames and overwriting each other's rollback script and log.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         log_dir = log_root / ".library_cleaner"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"tag_editor_{timestamp}.json"
